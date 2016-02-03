@@ -1,0 +1,14 @@
+{application, aqdrv,
+ [
+  {description, "An Erlang aqdrv library"},
+  {vsn, "1"},
+  {modules, [
+             aqdrv, aqdrv_nif
+            ]},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {env, []}
+ ]}.
