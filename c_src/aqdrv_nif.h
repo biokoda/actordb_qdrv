@@ -80,6 +80,7 @@ typedef struct priv_data
 #ifndef _TESTAPP_
 	ErlNifTid *wtids;
 	ErlNifTid *stids;
+	u8 doCompr;
 #endif
 } priv_data;
 
@@ -94,9 +95,11 @@ typedef struct thrinf
 
 typedef struct coninf
 {
-	// writes are staged inside here
+	// writes are staged inside iov
 	struct iovec *iov;
 	qfile *lastFile;
+	// When using compression, we compress into this buffer.
+	u8 *wbuf;
 	ErlNifEnv *env;
 	u32 lastWpos;
 	u32 pgrem;
@@ -107,7 +110,7 @@ typedef struct coninf
 	// replication data is prepended to iov array.
 	// this data gets sent to socket, but not written to disk.
 	int iovDiskSkip;
-	u8 marker;
+	u8 doCompr;
 } coninf;
 
 typedef enum

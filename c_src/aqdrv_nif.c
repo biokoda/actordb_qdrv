@@ -31,6 +31,7 @@ static ERL_NIF_TERM atom_logname;
 static ERL_NIF_TERM atom_wthreads;
 static ERL_NIF_TERM atom_startindex;
 static ERL_NIF_TERM atom_paths;
+static ERL_NIF_TERM atom_compr;
 static ErlNifResourceType *connection_type;
 
 
@@ -105,6 +106,7 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	conn->iov = malloc(MAX_WRITES*sizeof(struct iovec));
 	conn->pgrem = PGSZ-1;
 	conn->env = enif_alloc_env();
+	conn->doCompr = pd->doCompr;
 
 	return enif_make_tuple2(env, enif_make_atom(env,"aqdrv"), enif_make_resource(env, conn));
 }
@@ -658,6 +660,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	*priv_out = priv;
 	priv->nThreads = 1;
 	priv->nPaths = 1;
+	priv->doCompr = 1;
 
 	memset(emptySpace, 0, PGSZ);
 
@@ -668,6 +671,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	atom_error = enif_make_atom(env, "error");
 	atom_paths = enif_make_atom(env, "paths");
 	atom_startindex = enif_make_atom(env, "startindex");
+	atom_compr = enif_make_atom(env, "compression");
 
 	connection_type = enif_open_resource_type(env, NULL, "connection_type",
 		destruct_connection, ERL_NIF_RT_CREATE, NULL);
@@ -697,6 +701,16 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			DBG("Param not tuple");
 			return -1;
 		}
+	}
+	if (enif_get_map_value(env, info, atom_compr, &value))
+	{
+		int compr = 1;
+		if (!enif_get_int(env, value, &compr))
+		{
+			DBG("Param not tuple");
+			return -1;
+		}
+		pd->doCompr = compr;
 	}
 #ifdef _TESTDBG_
 	if (enif_get_map_value(env, info, atom_logname, &value))
