@@ -1,12 +1,17 @@
 -module(aqdrv_nif).
--export([init/1, open/1, stage_write/2, write/5]).
+-export([init/1, open/1, stage_map/4,stage_data/3,stage_flush/1, write/5]).
 
 open(_) ->
 	exit(nif_library_not_loaded).
-stage_write(_,_) ->
+stage_map(_,_,_,_) ->
+	exit(nif_library_not_loaded).
+stage_data(_,_,_) ->
+	exit(nif_library_not_loaded).
+stage_flush(_) ->
 	exit(nif_library_not_loaded).
 write(_,_,_,_,_) ->
 	exit(nif_library_not_loaded).
+
 
 init(Info) ->
 	NifName = "aqdrv_nif",

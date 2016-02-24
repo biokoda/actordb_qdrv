@@ -1,6 +1,8 @@
 #ifndef _AQDRV_NIF_H
 #define _AQDRV_NIF_H
 
+#include "lz4frame.h"
+#include "lz4.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -29,6 +31,7 @@
 #include <mach/mach_time.h>
 #endif
 #define FILE_LIMIT 1024*1024*1024
+#define HDRMAX 512
 #define MAX_WRITES 1024
 #define MAX_WTHREADS 6
 #define u8 uint8_t
@@ -47,6 +50,9 @@ FILE *g_log = 0;
 #else
 # define DBG(X, ...)
 #endif
+
+#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 
 typedef struct qfile
 {
@@ -93,24 +99,28 @@ typedef struct thrinf
 	int pathIndex;
 } thrinf;
 
+typedef struct lz4buf
+{
+	LZ4F_compressionContext_t cctx;
+	u8 *buf;
+	u32 bufSize;
+	u32 uncomprSz;
+	u32 writeSize;
+	// u32 maxFrameSz;
+} lz4buf;
+
 typedef struct coninf
 {
-	// writes are staged inside iov
-	struct iovec *iov;
+	lz4buf data;
+	lz4buf map;
+	u8 *header;
 	qfile *lastFile;
-	// When using compression, we compress into this buffer.
-	u8 *wbuf;
-	ErlNifEnv *env;
+	// Position of last write in file
 	u32 lastWpos;
-	u32 pgrem;
-	u32 writeSize;
+	u32 headerSize;
+	u32 replSize;
 	int thread;
-	int iovSize;
-	int iovUsed;
-	// replication data is prepended to iov array.
-	// this data gets sent to socket, but not written to disk.
-	int iovDiskSkip;
-	u8 doCompr;
+	u8 started;
 } coninf;
 
 typedef enum

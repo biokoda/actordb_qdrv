@@ -22,8 +22,6 @@
 #define PGSZ 4096
 #define HEADER_SPACE 10
 
-static u8 emptySpace[PGSZ];
-
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_false;
 static ERL_NIF_TERM atom_error;
@@ -34,12 +32,36 @@ static ERL_NIF_TERM atom_paths;
 static ERL_NIF_TERM atom_compr;
 static ErlNifResourceType *connection_type;
 
+static const LZ4F_preferences_t lz4Prefs = {
+	{ LZ4F_max64KB, LZ4F_blockIndependent, LZ4F_contentChecksumEnabled, LZ4F_frame, 0, { 0, 0 } },
+	0,   /* compression level */
+	0,   /* autoflush */
+	{ 0, 0, 0, 0 },  /* reserved, must be set to 0 */
+};
+
+static void writeUint32(u8 *p, u32 v)
+{
+	p[0] = (u8)(v >> 24);
+	p[1] = (u8)(v >> 16);
+	p[2] = (u8)(v >> 8);
+	p[3] = (u8)v;
+}
+static void writeUint32LE(u8 *p, u32 v)
+{
+	p[0] = (u8)v;
+	p[1] = (u8)(v >> 8);
+	p[2] = (u8)(v >> 16);
+	p[3] = (u8)(v >> 24);
+}
 
 static void destruct_connection(ErlNifEnv *env, void *arg)
 {
 	coninf *r = (coninf*)arg;
-	free(r->iov);
-	enif_free_env(r->env);
+	LZ4F_freeCompressionContext(r->map.cctx);
+	LZ4F_freeCompressionContext(r->data.cctx);
+	free(r->map.buf);
+	free(r->data.buf);
+	free(r->header);
 }
 
 static ERL_NIF_TERM make_error_tuple(ErlNifEnv *env, const char *reason)
@@ -100,92 +122,171 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 		return atom_false;
 	memset(conn,0,sizeof(coninf));
 	conn->thread = thread % pd->nThreads;
-	conn->marker = 2;
-	conn->iovUsed = 0;
-	conn->iovSize = MAX_WRITES;
-	conn->iov = malloc(MAX_WRITES*sizeof(struct iovec));
-	conn->pgrem = PGSZ-1;
-	conn->env = enif_alloc_env();
-	conn->doCompr = pd->doCompr;
+	conn->data.buf = calloc(1,PGSZ);
+	conn->data.bufSize = PGSZ;
+	conn->map.bufSize = PGSZ;
+	conn->map.buf = calloc(1,PGSZ);
+	conn->header = calloc(1,HDRMAX);
+	LZ4F_createCompressionContext(&conn->data.cctx, LZ4F_VERSION);
+	LZ4F_createCompressionContext(&conn->map.cctx, LZ4F_VERSION);
 
 	return enif_make_tuple2(env, enif_make_atom(env,"aqdrv"), enif_make_resource(env, conn));
 }
 
-// add a binary to connection iovec
-static int add_bin(coninf *res, ErlNifBinary bin, int position, u32 max_position)
+static u32 add_bin(coninf *con, lz4buf *buf, ErlNifBinary bin, u32 offset)
 {
-	u32 binOffset = 0;
-	while (binOffset < bin.size)
+	u32 toWrite = MIN(64*1024, bin.size - offset);
+	size_t bWritten = 0;
+	size_t szNeed = LZ4F_compressBound(toWrite, &lz4Prefs);
+
+	if (szNeed > buf->bufSize - buf->writeSize)
 	{
-		// Never copy more than pgrem bytes at once. Because we must add a page marker.
-		u32 ncpy = res->pgrem > (bin.size-binOffset) ? (bin.size-binOffset) : res->pgrem;
-
-		if (position >= max_position)
-			return -1;
-
-		if (res->iovSize < position+2)
-		{
-			res->iovSize *= 1.5;
-			res->iov = realloc(res->iov, res->iovSize*sizeof(struct iovec));
-		}
-
-		res->iov[position].iov_base = bin.data + binOffset;
-		res->iov[position].iov_len = ncpy;
-		position++;
-
-		binOffset += ncpy;
-		res->pgrem -= ncpy;
-		res->writeSize += ncpy;
-
-		// If we completed a page, put down a marker.
-		if (res->pgrem == 0)
-		{
-			res->iov[position].iov_base = &res->marker;
-			res->iov[position].iov_len = 1;
-			position++;
-			res->pgrem = PGSZ-1;
-			res->writeSize++;
-		}
+		buf->bufSize += szNeed;
+		buf->buf = realloc(buf->buf, buf->bufSize);
 	}
-	if (position > res->iovUsed)
-		res->iovUsed = position;
-	return position;
+
+	if (!con->started)
+	{
+		bWritten = LZ4F_compressBegin(buf->cctx, buf->buf, buf->bufSize, &lz4Prefs);
+		if (LZ4F_isError(bWritten))
+		{
+			DBG("Can not write begin");
+			return 0;
+		}
+		buf->writeSize = bWritten;
+	}
+
+	bWritten = LZ4F_compressUpdate(buf->cctx, 
+		buf->buf + buf->writeSize, 
+		buf->bufSize - buf->writeSize, 
+		bin.data + offset, toWrite, NULL);
+	if (LZ4F_isError(bWritten))
+	{
+		DBG("Can not write data");
+		return 0;
+	}
+
+	buf->writeSize += bWritten;
+	buf->uncomprSz += bin.size;
+
+	return toWrite;
 }
 
-// To minimize the amount of memcpy and write calls we
-// stage data before sending it to write thread.
-// We leave a room at beginning for HEADER_SPACE (replication socket header and write header) elements. 
-// One of these is marker on first write. 
-// We do not know if we need a marker there or not. 
-// If entire write is < PGSZ, then marker is not needed.
-static ERL_NIF_TERM q_stage(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+// Call before q_stage
+// arg0 - con
+// arg1 - name
+// arg2 - type
+// arg3 - data size
+static ERL_NIF_TERM q_stage_map(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	ErlNifBinary bin;
+	int type;
 	coninf *res = NULL;
-	ERL_NIF_TERM termcpy;
+	u32 dataSize;
+	u8 size = 0;
+	u8 buf[255];
+
+	if (argc != 4)
+		return atom_false;
 
 	if (!enif_get_resource(env, argv[0], connection_type, (void **) &res))
 		return enif_make_badarg(env);
-	if (!enif_is_binary(env, argv[1]))
-		return make_error_tuple(env, "not binary");
+	if (!enif_inspect_binary(env, argv[1], &bin))
+		return make_error_tuple(env, "name binary");
+	if (!enif_get_int(env, argv[2], &type))
+		return make_error_tuple(env, "type not int");
+	if (!enif_get_uint(env, argv[3], &dataSize))
+		return make_error_tuple(env, "data size not int");
 
-	// Create copy to local environment so pointer to data is kept in place
-	termcpy = enif_make_copy(res->env, argv[1]);
-	if (!enif_inspect_binary(env, termcpy, &bin))
-		return make_error_tuple(env, "not binary");
+	if (type > 255 || bin.size > 128)
+		return atom_false;
 
-	add_bin(res, bin, res->iovUsed + HEADER_SPACE, ~0);
+	DBG("stage_map");
 
-	return enif_make_uint(env, res->writeSize);
+	// <<EntireLen, SizeName, Name:SizeName/binary, 
+	//   DataType, Size:varint,UncompressedOffset:varint>>
+	buf[1] = (u8)bin.size;
+	buf[1+1+bin.size] = (u8)type;
+	memcpy(buf+1+1, bin.data, bin.size);
+	// Entire len (1), name len (1), type (1)
+	size = bin.size + 1 + 1 + 1;
+	writeUint32(buf+size, dataSize);
+	size += 4;
+	writeUint32(buf+size, res->data.uncomprSz);
+	size += 4;
+	buf[0] = size;
+
+	bin.data = buf;
+	bin.size = size;
+	add_bin(res, &res->map, bin, 0);
+
+	return atom_ok;
 }
 
-// add erlang iolist to connection iovec
-static int add_list(coninf *res, ErlNifEnv *env, ERL_NIF_TERM iol, int position)
+static ERL_NIF_TERM q_stage_data(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	ErlNifBinary bin;
+	coninf *res = NULL;
+	u32 offset;
+
+	if (argc != 3)
+		return atom_false;
+
+	if (!enif_get_resource(env, argv[0], connection_type, (void **) &res))
+		return enif_make_badarg(env);
+	if (!enif_inspect_binary(env, argv[1], &bin))
+		return make_error_tuple(env, "not binary");
+	if (!enif_get_uint(env, argv[2], &offset))
+		return make_error_tuple(env, "not uint");
+
+	DBG("stage data");
+
+	enif_consume_timeslice(env,98);
+	offset = add_bin(res, &res->data, bin, offset);
+	res->started = 1;
+	return enif_make_uint(env, offset);
+}
+
+static ERL_NIF_TERM q_flush(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	coninf *con = NULL;
+	size_t bWritten;
+
+	if (argc != 1)
+		return atom_false;
+
+	if (!enif_get_resource(env, argv[0], connection_type, (void **) &con))
+		return enif_make_badarg(env);
+
+	DBG("flushing");
+
+	bWritten = LZ4F_compressEnd(con->map.cctx, 
+			con->map.buf + con->map.writeSize, 
+			con->map.bufSize - con->map.writeSize, NULL);
+	if (LZ4F_isError(bWritten))
+		return atom_false;
+	con->map.writeSize += bWritten;
+
+	bWritten = LZ4F_compressEnd(con->data.cctx, 
+			con->data.buf + con->data.writeSize, 
+			con->data.bufSize - con->data.writeSize, NULL);
+	if (LZ4F_isError(bWritten))
+		return atom_false;
+	con->data.writeSize += bWritten;
+
+	enif_consume_timeslice(env,95);
+	return enif_make_tuple2(env, 
+		enif_make_uint(env, con->map.writeSize),
+		enif_make_uint(env, con->data.writeSize));
+}
+
+static u32 list_to_bin(u8 *buf, u32 maxSz, ErlNifEnv *env, ERL_NIF_TERM iol)
 {
 	ErlNifBinary bin;
 	ERL_NIF_TERM list[5];
 	ERL_NIF_TERM head[5];
 	int depth = 0;
+	u32 pos = 0;
 	list[0] = iol;
 	while (1)
 	{
@@ -214,13 +315,13 @@ static int add_list(coninf *res, ErlNifEnv *env, ERL_NIF_TERM iol, int position)
 				DBG("Not binary");
 				return -1;
 			}
-			position = add_bin(res, bin, position, HEADER_SPACE);
-
-			if (position < 0)
-				return -1;
+			if (pos + bin.size >= maxSz)
+				return 0;
+			memcpy(buf + pos, bin.data, bin.size);
+			pos += bin.size;
 		}
 	}
-	return position;
+	return pos;
 }
 
 // argv0 - Ref
@@ -230,13 +331,11 @@ static int add_list(coninf *res, ErlNifEnv *env, ERL_NIF_TERM iol, int position)
 // argv4 - Iolist
 static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-	int i;
 	ErlNifPid pid;
 	qitem *item;
 	priv_data *pd = (priv_data*)enif_priv_data(env);
 	db_command *cmd = NULL;
 	coninf *res = NULL;
-	u32 dataSize;
 
 	if (argc != 5)
 		return make_error_tuple(env, "takes 5 args");
@@ -252,41 +351,21 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	if (!enif_is_list(env, argv[4]))
 		return make_error_tuple(env, "missing header iolist");
 
-	dataSize = res->writeSize;
-	// Replication data sent over socket
-	i = add_list(res, env, argv[3], 0);
-	if (i == -1)
-		return make_error_tuple(env, "failed writing replication data");
-	res->iovDiskSkip = i;
+	// Replication data is prepended to header (it is not written to disk)
+	res->replSize = list_to_bin(res->header, HDRMAX, env, argv[3]);
+	if (!res->replSize)
+		return make_error_tuple(env, "repl data too large");
 
-	// set writeSize back to what it was and reset pgrem counter.
-	// Replication data only gets sent over socket and writeSize needs to hold 
-	// number of bytes stored to disk.
-	res->writeSize = dataSize;
-	// We set full PGSZ because data header is expected to have a page marker in it already.
-	res->pgrem = PGSZ;
-
-	// Disk header data
-	i = add_list(res, env, argv[4], i);
-	if (i == -1)
-		return make_error_tuple(env, "failed writing data header");
-	if (res->writeSize > PGSZ)
-	{
-		u32 szEmpty = PGSZ - ((res->writeSize - dataSize) % PGSZ);
-		if (i >= HEADER_SPACE-1)
-			return make_error_tuple(env, "not enough space in header");
-		// We must seperate data header and data sections to their own (sets of) respective pages.
-
-		// Empty space to fill up header to end of page.
-		res->iov[HEADER_SPACE-2].iov_base = emptySpace;
-		res->iov[HEADER_SPACE-2].iov_len = szEmpty;
-		res->writeSize += szEmpty;
-
-		// Add page marker before data.
-		res->iov[HEADER_SPACE-1].iov_base = &res->marker;
-		res->iov[HEADER_SPACE-1].iov_len = 1;
-		res->writeSize++;
-	}
+	// Start LZ4 skippable frame after replication data.  
+	// 4 bytes marker
+	writeUint32LE(res->header + res->replSize, 0x184D2A50);
+	// Write header 
+	res->headerSize = list_to_bin(res->header + res->replSize + 8, HDRMAX - 8 - res->replSize, env, argv[4]);
+	if (!res->headerSize)
+		return make_error_tuple(env, "header too large");
+	// We now know size so write it before data in reserved 4 bytes.
+	writeUint32LE(res->header + res->replSize + 4, res->headerSize);
+	res->headerSize += 8;
 
 	enif_keep_resource(res);
 	item = command_create(res->thread, -1, pd);
@@ -296,32 +375,36 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	cmd->pid = pid;
 	cmd->conn = res;
 
-	enif_consume_timeslice(env,90);
+	enif_consume_timeslice(env,95);
 	return push_command(res->thread, -1, pd, item);
 }
 
 static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 {
-	int rc = 0, i;
-	if (con->iovSize)
-	{
-		#if defined(__linux__)
-		rc = pwritev(data->curFile->fd, &con->iov[con->iovDiskSkip], con->iovUsed + con->iovDiskSkip, writePos);
-		#else
-		lseek(data->curFile->fd, writePos, SEEK_SET);
-		rc = writev(data->curFile->fd, &con->iov[con->iovDiskSkip], con->iovUsed + con->iovDiskSkip);
-		#endif
-		DBG("WRITEV! %d",rc);
+	int rc = 0;
+	struct iovec iov[3];
 
-		enif_clear_env(con->env);
-		con->iovDiskSkip = con->iovUsed = 0;
-		con->pgrem = PGSZ-1;
-		for (i = 0; i < HEADER_SPACE; i++)
-		{
-			con->iov[i].iov_base = NULL;
-			con->iov[i].iov_len = 0;
-		}
-	}
+	iov[0].iov_base = con->header + con->replSize;
+	iov[0].iov_len = con->headerSize;
+	iov[1].iov_base = con->map.buf;
+	iov[1].iov_len = con->map.writeSize;
+	iov[2].iov_base = con->data.buf;
+	iov[2].iov_len = con->data.writeSize;
+
+#if defined(__linux__)
+	rc = pwritev(data->curFile->fd, iov, 3, writePos);
+#else
+	lseek(data->curFile->fd, writePos, SEEK_SET);
+	rc = writev(data->curFile->fd, iov, 3);
+#endif
+	DBG("WRITEV! %d",rc);
+
+	// enif_clear_env(con->env);
+	con->map.bufSize = con->data.bufSize = 0;
+	con->map.uncomprSz = con->data.uncomprSz = 0;
+	con->map.writeSize = con->data.writeSize = 0;
+	con->headerSize = con->replSize = 0;
+
 	return rc;
 }
 
@@ -333,15 +416,12 @@ static u32 reserve_write(thrinf *data, qitem *item)
 	u8 movedForward = 0, waiting = 0;
 	db_command *cmd = (db_command*)item->cmd;
 
-	size = cmd->conn->writeSize;
+	size = cmd->conn->data.writeSize + cmd->conn->map.writeSize + cmd->conn->headerSize;
 
 	if (size > PGSZ)
 	{
-		const u8 unaligned = (size % PGSZ > 0 ? 1 : 0);
-		// Space for markers
-		size += unaligned + (size-PGSZ) / PGSZ;
 		// page alignment
-		if (unaligned)
+		if (size % PGSZ)
 			size += (PGSZ - (size % PGSZ));
 	}
 	else
@@ -662,8 +742,6 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	priv->nPaths = 1;
 	priv->doCompr = 1;
 
-	memset(emptySpace, 0, PGSZ);
-
 	atom_false = enif_make_atom(env,"false");
 	atom_ok = enif_make_atom(env,"ok");
 	atom_logname = enif_make_atom(env, "logname");
@@ -682,7 +760,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	{
 		if (!enif_get_int(env,value,&priv->nThreads))
 			return -1;
-		priv->nThreads = priv->nThreads > MAX_WTHREADS ? MAX_WTHREADS : priv->nThreads;
+		priv->nThreads = MIN(MAX_WTHREADS, priv->nThreads);
 	}
 	if (enif_get_map_value(env, info, atom_startindex, &value))
 	{
@@ -710,7 +788,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			DBG("Param not tuple");
 			return -1;
 		}
-		pd->doCompr = compr;
+		priv->doCompr = compr;
 	}
 #ifdef _TESTDBG_
 	if (enif_get_map_value(env, info, atom_logname, &value))
@@ -839,7 +917,9 @@ static void on_unload(ErlNifEnv* env, void* pd)
 
 static ErlNifFunc nif_funcs[] = {
 	{"open", 1, q_open},
-	{"stage_write", 2, q_stage},
+	{"stage_map", 4, q_stage_map},
+	{"stage_data", 3, q_stage_data},
+	{"stage_flush", 1, q_flush},
 	{"write", 5, q_write},
 };
 
