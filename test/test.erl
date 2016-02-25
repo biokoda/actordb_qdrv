@@ -50,7 +50,7 @@ async() ->
 	ets:insert(ops,{r,0}),
 	% Random sized buffers
 	% +binary:decode_unsigned(crypto:rand_bytes(2)
-	RandBytes = [crypto:rand_bytes(4095) || _ <- lists:seq(1,1000)],
+	RandBytes = [crypto:rand_bytes(495) || _ <- lists:seq(1,1000)],
 	Pids = [element(1,spawn_monitor(fun() -> w(P,RandBytes) end)) || P <- lists:seq(1,512)],
 	receive
 		{'DOWN',_Monitor,_,_PID,Reason} ->
@@ -75,7 +75,7 @@ w(Con,Counter,[Rand|T],L) ->
 			?debugFmt("Time ~pms, wpos=~pmb",[Time div 1000000, WPos div 1000000]);
 		%  Pos rem (1024*1024*1) == 0;
 		_ when Counter rem 500 == 0 ->
-			?debugFmt("~p",[WPos]),
+			?debugFmt("~pmb",[WPos div 1000000]),
 			% ?debugFmt("Offset=~p, diffCpy=~p, diffSetup=~p diffAll=~p",[Pos,Diff1,SetupDiff,Diff2]);
 			ok;
 		_ ->

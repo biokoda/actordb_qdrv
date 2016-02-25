@@ -520,8 +520,10 @@ static void *wthread(void *arg)
 	thrinf* data = (thrinf*)arg;
 	int wcount = 0;
 
+#ifdef __APPLE__
 	mach_timebase_info_data_t info;
 	mach_timebase_info(&info);
+#endif
 
 	while (1)
 	{
@@ -535,13 +537,21 @@ static void *wthread(void *arg)
 		{
 			u32 resp;
 			// u64 diff = 0, setupDiff = 0, diff1 = 0;
-
+		#ifdef __APPLE__
 			u64 start = mach_absolute_time();
 			resp = reserve_write(data, item);
 			u64 stop = mach_absolute_time();
 			u64 diff1 = (stop-start);
 			diff1 *= info.numer;
 			diff1 /= info.denom;
+		#else
+			struct timespec start;
+			clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+			resp = reserve_write(data, item);
+			struct timespec stop;
+			clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &stop);
+			u64 diff1 = ((stop.tv_sec * 1000000000UL) + stop.tv_nsec) - ((start.tv_sec * 1000000000UL) + start.tv_nsec);
+		#endif
 			// diff *= info.numer;
 			// diff /= info.denom;
 			// setupDiff *= info.numer;
@@ -659,18 +669,18 @@ static void *sthread(void *arg)
 				}
 			}
 
-			// if (syncFrom < highestPos)
-			// {
-			// 	DBG("sync from=%u, to=%u, refc=%d",syncFrom, highestPos, (int)curRefc);
-			// 	#if defined(__APPLE__) || defined(_WIN32)
-			// 		fsync(curFile->fd);
-			// 	#elif define(__linux__)
-			// 		sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
-			// 			SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
-			// 	#else
-			// 		fdatasync(curFile->fd);
-			// 	#endif
-			// }
+			if (syncFrom < highestPos)
+			{
+				DBG("sync from=%u, to=%u, refc=%d",syncFrom, highestPos, (int)curRefc);
+				#if defined(__APPLE__) || defined(_WIN32)
+					fsync(curFile->fd);
+				#elif defined(__linux__)
+					sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
+						SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
+				#else
+					fdatasync(curFile->fd);
+				#endif
+			}
 
 			if (curReservePos > 0 && curFile->next == NULL)
 			{
