@@ -1,4 +1,4 @@
-#define _TESTDBG_
+// #define _TESTDBG_
 #define _GNU_SOURCE
 #ifndef  _WIN32
 #include <sys/mman.h>
@@ -147,6 +147,7 @@ static u32 add_bin(coninf *con, lz4buf *buf, ErlNifBinary bin, u32 offset)
 
 	if (!con->started)
 	{
+		DBG("Frame begin");
 		bWritten = LZ4F_compressBegin(buf->cctx, buf->buf, buf->bufSize, &lz4Prefs);
 		if (LZ4F_isError(bWritten))
 		{
@@ -156,18 +157,26 @@ static u32 add_bin(coninf *con, lz4buf *buf, ErlNifBinary bin, u32 offset)
 		buf->writeSize = bWritten;
 	}
 
+	if (szNeed > buf->bufSize - buf->writeSize)
+	{
+		buf->bufSize += szNeed;
+		buf->buf = realloc(buf->buf, buf->bufSize);
+	}
+
 	bWritten = LZ4F_compressUpdate(buf->cctx, 
 		buf->buf + buf->writeSize, 
 		buf->bufSize - buf->writeSize, 
 		bin.data + offset, toWrite, NULL);
 	if (LZ4F_isError(bWritten))
 	{
-		DBG("Can not write data");
+		DBG("Can not write data ws=%u, offset=%u, toWrite=%u, bufsize=%u",buf->writeSize, offset, toWrite, buf->bufSize);
 		return 0;
 	}
 
 	buf->writeSize += bWritten;
 	buf->uncomprSz += bin.size;
+
+	DBG("Wrote ws=%u, offset=%u, toWrite=%u, bufsize=%u",buf->writeSize, offset, toWrite, buf->bufSize);
 
 	return toWrite;
 }
@@ -218,7 +227,8 @@ static ERL_NIF_TERM q_stage_map(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 
 	bin.data = buf;
 	bin.size = size;
-	add_bin(res, &res->map, bin, 0);
+	if (!add_bin(res, &res->map, bin, 0))
+		return atom_false;
 
 	return atom_ok;
 }
@@ -243,6 +253,8 @@ static ERL_NIF_TERM q_stage_data(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
 
 	enif_consume_timeslice(env,98);
 	offset = add_bin(res, &res->data, bin, offset);
+	if (!offset)
+		return atom_false;
 	res->started = 1;
 	return enif_make_uint(env, offset);
 }
@@ -404,6 +416,7 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 	con->map.uncomprSz = con->data.uncomprSz = 0;
 	con->map.writeSize = con->data.writeSize = 0;
 	con->headerSize = con->replSize = 0;
+	con->started = 0;
 
 	return rc;
 }
@@ -507,8 +520,8 @@ static void *wthread(void *arg)
 	thrinf* data = (thrinf*)arg;
 	int wcount = 0;
 
-	// mach_timebase_info_data_t info;
-	// mach_timebase_info(&info);
+	mach_timebase_info_data_t info;
+	mach_timebase_info(&info);
 
 	while (1)
 	{
@@ -523,12 +536,12 @@ static void *wthread(void *arg)
 			u32 resp;
 			// u64 diff = 0, setupDiff = 0, diff1 = 0;
 
-			// u64 start = mach_absolute_time();
+			u64 start = mach_absolute_time();
 			resp = reserve_write(data, item);
-			// u64 stop = mach_absolute_time();
-			// u64 diff1 = (stop-start);
-			// diff1 *= info.numer;
-			// diff1 /= info.denom;
+			u64 stop = mach_absolute_time();
+			u64 diff1 = (stop-start);
+			diff1 *= info.numer;
+			diff1 /= info.denom;
 			// diff *= info.numer;
 			// diff /= info.denom;
 			// setupDiff *= info.numer;
@@ -538,7 +551,10 @@ static void *wthread(void *arg)
 			// 	enif_make_uint64(item->env, (ErlNifUInt64)diff),
 			// 	enif_make_uint64(item->env, (ErlNifUInt64)setupDiff),
 			// 	enif_make_uint64(item->env, (ErlNifUInt64)diff1));
-			cmd->answer = enif_make_uint(item->env, resp);
+			// cmd->answer = enif_make_uint(item->env, resp);
+			cmd->answer = enif_make_tuple2(item->env, 
+				enif_make_uint(item->env, resp), 
+				enif_make_uint64(item->env, (ErlNifUInt64)diff1));
 			respond_cmd(data, item);
 			++wcount;
 		}
@@ -643,18 +659,18 @@ static void *sthread(void *arg)
 				}
 			}
 
-			if (syncFrom < highestPos)
-			{
-				DBG("sync from=%u, to=%u, refc=%d",syncFrom, highestPos, (int)curRefc);
-				#if defined(__APPLE__) || defined(_WIN32)
-					fsync(curFile->fd);
-				#elif define(__linux__)
-					sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
-						SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
-				#else
-					fdatasync(curFile->fd);
-				#endif
-			}
+			// if (syncFrom < highestPos)
+			// {
+			// 	DBG("sync from=%u, to=%u, refc=%d",syncFrom, highestPos, (int)curRefc);
+			// 	#if defined(__APPLE__) || defined(_WIN32)
+			// 		fsync(curFile->fd);
+			// 	#elif define(__linux__)
+			// 		sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
+			// 			SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
+			// 	#else
+			// 		fdatasync(curFile->fd);
+			// 	#endif
+			// }
 
 			if (curReservePos > 0 && curFile->next == NULL)
 			{
