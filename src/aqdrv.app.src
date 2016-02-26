@@ -1,7 +1,7 @@
 {application, aqdrv,
  [
   {description, "An Erlang aqdrv library"},
-  {vsn, "1"},
+  {vsn, "0.10.15"},
   {modules, [
              aqdrv, aqdrv_nif
             ]},

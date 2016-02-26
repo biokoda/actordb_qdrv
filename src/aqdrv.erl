@@ -1,11 +1,23 @@
 -module(aqdrv).
--export([init/1, open/1, stage_map/4, stage_data/2, stage_flush/1, write/3]).
+-export([init/1, open/1, stage_map/4, stage_data/2, 
+	stage_flush/1, write/3, set_tunnel_connector/0, set_thread_fd/4,
+	replicate_opts/2, replicate_opts/3]).
 
 init(Info) when is_map(Info) ->
 	aqdrv_nif:init(Info).
 
 open(Hash) ->
 	aqdrv_nif:open(Hash).
+
+set_tunnel_connector() ->
+	aqdrv_nif:set_tunnel_connector().
+set_thread_fd(Thread,Fd,Pos,Type) ->
+	aqdrv_nif:set_thread_fd(Thread,Fd,Pos,Type).
+
+replicate_opts(Con,PacketPrefix) ->
+	replicate_opts(Con,PacketPrefix,1).
+replicate_opts({actordb_driver, _Ref, Connection},PacketPrefix,Type) ->
+	ok = aqdrv_nif:replicate_opts(Connection,PacketPrefix,Type).
 
 % Must be called before stage_data.
 % Sets name of event (binary), type (unsigned char) and size of data.

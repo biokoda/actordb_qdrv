@@ -1,5 +1,7 @@
 -module(aqdrv_nif).
--export([init/1, open/1, stage_map/4,stage_data/3,stage_flush/1, write/5]).
+-export([init/1, open/1, stage_map/4,stage_data/3,
+	stage_flush/1, write/5, set_tunnel_connector/0, set_thread_fd/4,
+	replicate_opts/3]).
 
 open(_) ->
 	exit(nif_library_not_loaded).
@@ -11,7 +13,12 @@ stage_flush(_) ->
 	exit(nif_library_not_loaded).
 write(_,_,_,_,_) ->
 	exit(nif_library_not_loaded).
-
+set_tunnel_connector() ->
+	exit(nif_library_not_loaded).
+set_thread_fd(_,_,_,_) ->
+	exit(nif_library_not_loaded).
+replicate_opts(_,_,_) ->
+	exit(nif_library_not_loaded).
 
 init(Info) ->
 	NifName = "aqdrv_nif",

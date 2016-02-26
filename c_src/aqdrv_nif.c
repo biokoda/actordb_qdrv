@@ -30,6 +30,8 @@ static ERL_NIF_TERM atom_wthreads;
 static ERL_NIF_TERM atom_startindex;
 static ERL_NIF_TERM atom_paths;
 static ERL_NIF_TERM atom_compr;
+static ERL_NIF_TERM atom_tcpfail;
+static ERL_NIF_TERM atom_drivername;
 static ErlNifResourceType *connection_type;
 
 static const LZ4F_preferences_t lz4Prefs = {
@@ -102,6 +104,45 @@ static ERL_NIF_TERM push_command(int thread, int syncThread, priv_data *pd, qite
 	{
 		return make_error_tuple(item->env, "command_push_failed");
 	}
+	return atom_ok;
+}
+
+static ERL_NIF_TERM set_tunnel_connector(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	priv_data *pd = (priv_data*)enif_priv_data(env);
+
+	enif_self(env, &pd->tunnelConnector);
+
+	return atom_ok;
+}
+
+static ERL_NIF_TERM set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	int thread, fd, type, pos;
+	qitem *item;
+	db_command *cmd;
+	priv_data *pd = (priv_data*)enif_priv_data(env);
+
+	if (!enif_get_int(env,argv[0],&thread))
+		return make_error_tuple(env, "not_int");
+	if (!enif_get_int(env,argv[1],&fd))
+		return make_error_tuple(env, "not_int");
+	if (!enif_get_int(env,argv[2],&pos))
+		return make_error_tuple(env, "not_int");
+	if (!enif_get_int(env,argv[3],&type))
+		return make_error_tuple(env, "not_int");
+
+	if (pos > 8 || pos < 0 || fd < 3 || thread >= pd->nThreads * pd->nPaths)
+		return atom_false;
+
+	item = command_create(thread,-1,pd);
+	cmd = (db_command*)item->cmd;
+	cmd->type = cmd_set_socket;
+	cmd->arg = enif_make_int(item->env,fd);
+	cmd->arg1 = enif_make_int(item->env,pos);
+	cmd->arg2 = enif_make_int(item->env,type);
+	push_command(thread, -1, pd, item);
+	enif_consume_timeslice(env,90);
 	return atom_ok;
 }
 
@@ -391,6 +432,62 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	return push_command(res->thread, -1, pd, item);
 }
 
+
+static ERL_NIF_TERM replicate_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	coninf *res;
+	ErlNifBinary bin;
+
+	DBG("replicate_opts");
+
+	if (!(argc == 3))
+		return enif_make_badarg(env);
+	if(!enif_get_resource(env, argv[0], connection_type, (void **) &res))
+		return make_error_tuple(env, "invalid_connection");
+	if (!enif_inspect_iolist_as_binary(env, argv[1], &bin))
+		return make_error_tuple(env, "not_iolist");
+
+	DBG("do_replicate_opts %zu", bin.size);
+	if (res->packetPrefixSize < bin.size)
+	{
+		free(res->packetPrefix);
+		res->packetPrefixSize = 0;
+		res->packetPrefix = NULL;
+	}
+
+	if (bin.size > 0)
+	{
+		int dorepl;
+		if (!enif_get_int(env,argv[2],&(dorepl)))
+			return make_error_tuple(env, "repltype_not_int");
+		if (!res->packetPrefix)
+			res->packetPrefix = malloc(bin.size);
+
+		res->doReplicate = dorepl;
+		memcpy(res->packetPrefix,bin.data,bin.size);
+		res->packetPrefixSize = bin.size;
+	}
+	else
+	{
+		if (!res->packetPrefix)
+			free(res->packetPrefix);
+		res->packetPrefix = NULL;
+		res->packetPrefixSize = 0;
+		res->doReplicate = 0;
+	}
+	return atom_ok;
+}
+
+static void fail_send(int i, thrinf *thr)
+{
+	enif_send(NULL, &thr->pd->tunnelConnector, thr->env, 
+		enif_make_tuple4(thr->env, 
+			atom_tcpfail,atom_drivername, 
+			enif_make_int(thr->env, thr->pd->nPaths * thr->pd->nThreads + thr->pd->nThreads), 
+			enif_make_int(thr->env, i)));
+	enif_clear_env(thr->env);
+}
+
 static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 {
 	int rc = 0;
@@ -500,6 +597,54 @@ static u32 reserve_write(thrinf *data, qitem *item)
 	return writePos;
 }
 
+static ERL_NIF_TERM do_set_socket(db_command *cmd, thrinf *thread, ErlNifEnv *env)
+{
+	int fd = 0;
+	int pos = -1;
+	int type = 1;
+	int opts;
+
+	if (!enif_get_int(env,cmd->arg,&fd))
+		return atom_error;
+	if (!enif_get_int(env,cmd->arg1,&pos))
+		return atom_error;
+	if (!enif_get_int(env,cmd->arg2,&type))
+		return atom_error;
+
+#ifndef _WIN32
+	opts = fcntl(fd,F_GETFL);
+	if (fcntl(fd, F_SETFL, opts & (~O_NONBLOCK)) == -1 || fcntl(fd,F_GETFL) & O_NONBLOCK)
+#else
+	opts = 0;
+	if (ioctlsocket(fd, FIONBIO, &opts) != 0)
+#endif
+	{
+		DBG("Can not set to blocking socket");
+		fail_send(pos, thread);
+		return atom_false;
+	}
+#ifdef SO_NOSIGPIPE
+	opts = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (void *)&opts, sizeof(int)) != 0)
+	{
+		DBG("Unable to set nosigpipe");
+		fail_send(pos, thread);
+		return atom_false;
+	}
+#endif
+	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char*)&opts, sizeof(int)) != 0)
+	{
+		DBG("Unable to set socket nodelay");
+		fail_send(pos, thread);
+		return atom_false;
+	}
+
+	thread->sockets[pos] = fd;
+	thread->socket_types[pos] = type;
+
+	return atom_ok;
+}
+
 static void respond_cmd(thrinf *data, qitem *item)
 {
 	db_command *cmd = (db_command*)item->cmd;
@@ -529,44 +674,40 @@ static void *wthread(void *arg)
 	{
 		db_command *cmd;
 		qitem *item = queue_pop(data->tasks);
-		cmd 		= (db_command*)item->cmd;
+		cmd = (db_command*)item->cmd;
 
 		// DBG("wthr do=%d, curfile=%lld",cmd->type, data->curFile->logIndex);
 
 		if (cmd->type == cmd_write)
 		{
 			u32 resp;
+			// u64 diff1;
 			// u64 diff = 0, setupDiff = 0, diff1 = 0;
-		#ifdef __APPLE__
-			u64 start = mach_absolute_time();
+		// #ifdef __APPLE__
+		// 	u64 start = mach_absolute_time();
+		// 	resp = reserve_write(data, item);
+		// 	u64 stop = mach_absolute_time();
+		// 	diff1 = (stop-start);
+		// 	diff1 *= info.numer;
+		// 	diff1 /= info.denom;
+		// #else
+		// 	struct timespec start;
+		// 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+		//  resp = reserve_write(data, item);
+		// 	struct timespec stop;
+		// 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &stop);
+		// 	diff1 = ((stop.tv_sec * 1000000000UL) + stop.tv_nsec) - ((start.tv_sec * 1000000000UL) + start.tv_nsec);
+		// #endif
+
 			resp = reserve_write(data, item);
-			u64 stop = mach_absolute_time();
-			u64 diff1 = (stop-start);
-			diff1 *= info.numer;
-			diff1 /= info.denom;
-		#else
-			struct timespec start;
-			clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
-			resp = reserve_write(data, item);
-			struct timespec stop;
-			clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &stop);
-			u64 diff1 = ((stop.tv_sec * 1000000000UL) + stop.tv_nsec) - ((start.tv_sec * 1000000000UL) + start.tv_nsec);
-		#endif
-			// diff *= info.numer;
-			// diff /= info.denom;
-			// setupDiff *= info.numer;
-			// setupDiff /= info.denom;
-			// cmd->answer = enif_make_tuple4(item->env, 
-			// 	enif_make_uint(item->env, resp), 
-			// 	enif_make_uint64(item->env, (ErlNifUInt64)diff),
-			// 	enif_make_uint64(item->env, (ErlNifUInt64)setupDiff),
-			// 	enif_make_uint64(item->env, (ErlNifUInt64)diff1));
-			// cmd->answer = enif_make_uint(item->env, resp);
-			cmd->answer = enif_make_tuple2(item->env, 
-				enif_make_uint(item->env, resp), 
-				enif_make_uint64(item->env, (ErlNifUInt64)diff1));
+			cmd->answer = enif_make_uint(item->env, resp);
 			respond_cmd(data, item);
 			++wcount;
+		}
+		else if (cmd->type == cmd_set_socket)
+		{
+			cmd->answer = do_set_socket(cmd, data, item->env);
+			respond_cmd(data, item);
 		}
 		else if (cmd->type == cmd_stop)
 		{
@@ -776,6 +917,8 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	atom_paths = enif_make_atom(env, "paths");
 	atom_startindex = enif_make_atom(env, "startindex");
 	atom_compr = enif_make_atom(env, "compression");
+	atom_tcpfail = enif_make_atom(env, "tcpfail");
+	atom_drivername = enif_make_atom(env, "aqdrv");
 
 	connection_type = enif_open_resource_type(env, NULL, "connection_type",
 		destruct_connection, ERL_NIF_RT_CREATE, NULL);
@@ -872,7 +1015,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			priv->tasks[index] = inf->tasks = queue_create();
 			inf->pd = priv;
 			inf->curFile = priv->tailFile[i];
-			// inf->env = enif_alloc_env();
+			inf->env = enif_alloc_env();
 			atomic_fetch_add(&inf->curFile->refc, 1);
 
 			if (enif_thread_create("wthr", &(priv->wtids[index]), wthread, inf, NULL) != 0)
@@ -947,6 +1090,9 @@ static ErlNifFunc nif_funcs[] = {
 	{"stage_data", 3, q_stage_data},
 	{"stage_flush", 1, q_flush},
 	{"write", 5, q_write},
+	{"set_tunnel_connector",0,set_tunnel_connector},
+	{"set_thread_fd",4,set_thread_fd},
+	{"replicate_opts",3,replicate_opts},
 };
 
 ERL_NIF_INIT(aqdrv_nif, nif_funcs, on_load, NULL, NULL, on_unload);

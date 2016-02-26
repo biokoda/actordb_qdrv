@@ -34,6 +34,7 @@
 #define HDRMAX 512
 #define MAX_WRITES 1024
 #define MAX_WTHREADS 6
+#define MAX_CONNECTIONS 8
 #define u8 uint8_t
 #define i64 int64_t
 #define u64 uint64_t
@@ -87,6 +88,7 @@ typedef struct priv_data
 	ErlNifTid *wtids;
 	ErlNifTid *stids;
 	u8 doCompr;
+	ErlNifPid tunnelConnector;
 #endif
 } priv_data;
 
@@ -95,6 +97,9 @@ typedef struct thrinf
 	priv_data *pd;
 	queue *tasks;
 	qfile *curFile;
+	ErlNifEnv *env;
+	int sockets[MAX_CONNECTIONS];
+	int socket_types[MAX_CONNECTIONS];
 	int windex;
 	int pathIndex;
 } thrinf;
@@ -121,13 +126,20 @@ typedef struct coninf
 	u32 replSize;
 	int thread;
 	u8 started;
+	u8 doReplicate;
+	#ifndef _TESTAPP_
+	// Fixed part of packet prefix
+	char* packetPrefix;
+	int packetPrefixSize;
+	#endif
 } coninf;
 
 typedef enum
 {
 	cmd_stop  = 1,
 	cmd_write = 2,
-	cmd_sync = 3
+	cmd_sync = 3,
+	cmd_set_socket = 4
 } command_type;
 
 

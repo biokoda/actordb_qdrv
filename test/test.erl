@@ -1,6 +1,6 @@
 -module(test).
 -include_lib("eunit/include/eunit.hrl").
--define(CFG,#{threads => 1, startindex => {1}, paths => {"./"}, pwrite => 0}).
+-define(CFG,#{threads => 3, startindex => {1}, paths => {"./"}, pwrite => 0}).
 -define(INIT,aqdrv:init(?CFG)).
 
 run_test_() ->
@@ -50,8 +50,10 @@ async() ->
 	ets:insert(ops,{r,0}),
 	% Random sized buffers
 	% +binary:decode_unsigned(crypto:rand_bytes(2)
-	RandBytes = [crypto:rand_bytes(495) || _ <- lists:seq(1,1000)],
-	Pids = [element(1,spawn_monitor(fun() -> w(P,RandBytes) end)) || P <- lists:seq(1,512)],
+
+	% Every write is 4K minimum, so anything under 4K is irrelevant.
+	RandBytes = [crypto:rand_bytes(49) || _ <- lists:seq(1,1000)],
+	Pids = [element(1,spawn_monitor(fun() -> w(P,RandBytes) end)) || P <- lists:seq(1,100)],
 	receive
 		{'DOWN',_Monitor,_,_PID,Reason} ->
 			exit(Reason)
@@ -69,13 +71,13 @@ w(Con,Counter,[Rand|T],L) ->
 	ok = aqdrv:stage_map(Con, <<"ITEM1">>, 1, byte_size(Rand)),
 	ok = aqdrv:stage_data(Con, Rand),
 	{_,_} = aqdrv:stage_flush(Con),
-	{WPos,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
+	WPos = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
 	case ok of
-		_ when Time > 1000000 ->
-			?debugFmt("Time ~pms, wpos=~pmb",[Time div 1000000, WPos div 1000000]);
+		% _ when Time > 1000000 orelse Time2 > 1000000 ->
+		% 	?debugFmt("Time1 ~pms, Time2 ~pms, wpos=~pmb, ~p",[Time div 1000000, Time2 div 1000000, WPos div 1000000, Counter]);
 		%  Pos rem (1024*1024*1) == 0;
-		_ when Counter rem 500 == 0 ->
-			?debugFmt("~pmb",[WPos div 1000000]),
+		_ when Counter rem 100 == 0 ->
+			?debugFmt("~pmb, ~p",[WPos div 1000000, Counter]),
 			% ?debugFmt("Offset=~p, diffCpy=~p, diffSetup=~p diffAll=~p",[Pos,Diff1,SetupDiff,Diff2]);
 			ok;
 		_ ->
