@@ -490,25 +490,56 @@ static void fail_send(int i, thrinf *thr)
 
 static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 {
-	int rc = 0;
-	struct iovec iov[3];
+	int rc = 0, i = 0;
+	u8 bufSize[4];
+	struct iovec iov[4];
+	u32 entireLen = con->replSize + con->headerSize + con->map.writeSize + con->data.writeSize;
 
-	iov[0].iov_base = con->header + con->replSize;
-	iov[0].iov_len = con->headerSize;
-	iov[1].iov_base = con->map.buf;
-	iov[1].iov_len = con->map.writeSize;
-	iov[2].iov_base = con->data.buf;
-	iov[2].iov_len = con->data.writeSize;
+	writeUint32(bufSize, entireLen);
+
+	iov[0].iov_base = bufSize;
+	iov[0].iov_len = sizeof(bufSize);
+	iov[1].iov_base = con->header + con->replSize;
+	iov[1].iov_len = con->headerSize;
+	iov[2].iov_base = con->map.buf;
+	iov[2].iov_len = con->map.writeSize;
+	iov[3].iov_base = con->data.buf;
+	iov[3].iov_len = con->data.writeSize;
 
 #if defined(__linux__)
-	rc = pwritev(data->curFile->fd, iov, 3, writePos);
+	rc = pwritev(data->curFile->fd, &iov[1], 3, writePos);
 #else
 	lseek(data->curFile->fd, writePos, SEEK_SET);
-	rc = writev(data->curFile->fd, iov, 3);
+	rc = writev(data->curFile->fd, &iov[1], 3);
 #endif
 	DBG("WRITEV! %d",rc);
 
-	// enif_clear_env(con->env);
+	if (con->doReplicate)
+	{
+		iov[1].iov_base = con->header;
+		iov[1].iov_len = con->headerSize + con->replSize;
+
+		for (i = 0; i < MAX_CONNECTIONS; i++)
+		{
+			if (data->sockets[i] > 3 && data->socket_types[i] == 1)
+			{
+			#ifndef _WIN32
+				rc = writev(data->sockets[i],iov, 4);
+			#else
+				if (WSASend(data->sockets[i],iov, 4, &rt, 0, NULL, NULL) != 0)
+					rc = 0;
+			#endif
+				if (rc != entireLen+4)
+				{
+					DBG("Invalid result when sending %d",rt);
+					// close(thread->sockets[i]);
+					data->sockets[i] = 0;
+					fail_send(i,data);
+				}
+			}
+		}
+	}
+
 	con->map.bufSize = con->data.bufSize = 0;
 	con->map.uncomprSz = con->data.uncomprSz = 0;
 	con->map.writeSize = con->data.writeSize = 0;
