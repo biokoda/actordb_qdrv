@@ -63,6 +63,7 @@ static void destruct_connection(ErlNifEnv *env, void *arg)
 	LZ4F_freeCompressionContext(r->data.cctx);
 	free(r->map.buf);
 	free(r->data.buf);
+	free(r->packetPrefix);
 	free(r->header);
 }
 
