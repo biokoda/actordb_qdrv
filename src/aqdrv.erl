@@ -12,7 +12,13 @@ open(Hash) ->
 set_tunnel_connector() ->
 	aqdrv_nif:set_tunnel_connector().
 set_thread_fd(Thread,Fd,Pos,Type) ->
-	aqdrv_nif:set_thread_fd(Thread,Fd,Pos,Type).
+	case aqdrv_nif:set_thread_fd(Thread,Fd,Pos,Type) of
+		again ->
+			erlang:yield(),
+			set_thread_fd(Thread, Fd, Pos, Type);
+		Res ->
+			Res
+	end.
 
 replicate_opts(Con,PacketPrefix) ->
 	replicate_opts(Con,PacketPrefix,1).
@@ -43,8 +49,13 @@ stage_flush({aqdrv,Con}) ->
 % Write to disk. 
 write({aqdrv,Con}, [_|_] = ReplData, [_|_] = Header) ->
 	Ref = make_ref(),
-	ok = aqdrv_nif:write(Ref, self(),Con, ReplData, Header),
-	receive_answer(Ref).
+	case aqdrv_nif:write(Ref, self(),Con, ReplData, Header) of
+		again ->
+			erlang:yield(),
+			write({aqdrv,Con},ReplData, Header);
+		ok ->
+			receive_answer(Ref)
+	end.
 
 receive_answer(Ref) ->
 	receive

@@ -10,26 +10,30 @@
 #ifndef NOERL
 #include "erl_nif.h"
 #endif
-#include "queue.h"
 #ifndef _WIN32
 #include <pthread.h>
 #endif
 
 #if defined(_WIN32)
-#define ATOMIC 0
+	#define ATOMIC 0
 #else
-#if defined(__STDC_NO_ATOMICS__)
-#define ATOMIC 0
-#else
-#define ATOMIC 1
+	#if defined(__STDC_NO_ATOMICS__)
+		#define ATOMIC 0
+	#else
+		#define ATOMIC 1
+	#endif
 #endif
-#endif
+
 #if ATOMIC
-#include <stdatomic.h>
+	#include <stdatomic.h>
 #endif
+
 #if defined(__APPLE__)
-#include <mach/mach_time.h>
+	#include <mach/mach_time.h>
 #endif
+
+#include "lfqueue.h"
+
 #define FILE_LIMIT 1024*1024*1024
 #define HDRMAX 512
 #define MAX_WRITES 1024
@@ -41,7 +45,7 @@
 #define u32 uint32_t
 #define i32 int32_t
 
-FILE *g_log = 0;
+extern FILE *g_log;
 #if defined(_TESTDBG_)
 #ifndef _WIN32
 # define DBG(X, ...)  fprintf(g_log,"thr=%lld: " X "\r\n",(long long int)pthread_self(),##__VA_ARGS__) ;fflush(g_log);
@@ -54,6 +58,8 @@ FILE *g_log = 0;
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+
+
 
 typedef struct qfile
 {
@@ -158,5 +164,6 @@ typedef struct db_command
 	ERL_NIF_TERM arg4;
 #endif
 } db_command;
+
 
 #endif

@@ -32,7 +32,10 @@ static ERL_NIF_TERM atom_paths;
 static ERL_NIF_TERM atom_compr;
 static ERL_NIF_TERM atom_tcpfail;
 static ERL_NIF_TERM atom_drivername;
+static ERL_NIF_TERM atom_again;
 static ErlNifResourceType *connection_type;
+
+FILE *g_log = NULL;
 
 static const LZ4F_preferences_t lz4Prefs = {
 	{ LZ4F_max64KB, LZ4F_blockIndependent, LZ4F_contentChecksumEnabled, LZ4F_frame, 0, { 0, 0 } },
@@ -82,6 +85,8 @@ static qitem* command_create(int thread, int syncThread, priv_data *p)
 		thrCmds = p->syncTasks[syncThread];
 
 	item = queue_get_item(thrCmds);
+	if (!item)
+		return NULL;
 	if (item->cmd == NULL)
 	{
 		item->cmd = enif_alloc(sizeof(db_command));
@@ -136,6 +141,11 @@ static ERL_NIF_TERM set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 		return atom_false;
 
 	item = command_create(thread,-1,pd);
+	if (!item)
+	{
+		DBG("Returning again!");
+		return atom_again;
+	}
 	cmd = (db_command*)item->cmd;
 	cmd->type = cmd_set_socket;
 	cmd->arg = enif_make_int(item->env,fd);
@@ -404,6 +414,13 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	if (!enif_is_list(env, argv[4]))
 		return make_error_tuple(env, "missing header iolist");
 
+	item = command_create(res->thread, -1, pd);
+	if (!item)
+	{
+		DBG("Returning again!");
+		return atom_again;
+	}
+
 	// Replication data is prepended to header (it is not written to disk)
 	res->replSize = list_to_bin(res->header, HDRMAX, env, argv[3]);
 	if (!res->replSize)
@@ -421,7 +438,6 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	res->headerSize += 8;
 
 	enif_keep_resource(res);
-	item = command_create(res->thread, -1, pd);
 	cmd = (db_command*)item->cmd;
 	cmd->type = cmd_write;
 	cmd->ref = enif_make_copy(item->env, argv[0]);
@@ -672,58 +688,49 @@ static void *wthread(void *arg)
 
 	while (1)
 	{
-		db_command *cmd;
 		qitem *item = queue_pop(data->tasks);
-		cmd = (db_command*)item->cmd;
 
 		// DBG("wthr do=%d, curfile=%lld",cmd->type, data->curFile->logIndex);
-
-		if (cmd->type == cmd_write)
+		while (item)
 		{
-			u32 resp;
-			// u64 diff1;
-			// u64 diff = 0, setupDiff = 0, diff1 = 0;
-		// #ifdef __APPLE__
-		// 	u64 start = mach_absolute_time();
-		// 	resp = reserve_write(data, item);
-		// 	u64 stop = mach_absolute_time();
-		// 	diff1 = (stop-start);
-		// 	diff1 *= info.numer;
-		// 	diff1 /= info.denom;
-		// #else
-		// 	struct timespec start;
-		// 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
-		//  resp = reserve_write(data, item);
-		// 	struct timespec stop;
-		// 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &stop);
-		// 	diff1 = ((stop.tv_sec * 1000000000UL) + stop.tv_nsec) - ((start.tv_sec * 1000000000UL) + start.tv_nsec);
-		// #endif
-
-			resp = reserve_write(data, item);
-			cmd->answer = enif_make_uint(item->env, resp);
-			respond_cmd(data, item);
-			++wcount;
-		}
-		else if (cmd->type == cmd_set_socket)
-		{
-			cmd->answer = do_set_socket(cmd, data, item->env);
-			respond_cmd(data, item);
-		}
-		else if (cmd->type == cmd_stop)
-		{
-			respond_cmd(data, item);
-			break;
-		}
-
-		if (wcount >= MAX_WRITES || queue_size(data->tasks) == 0)
-		{
-			item = command_create(-1, data->pathIndex, data->pd);
+			db_command *cmd;
 			cmd = (db_command*)item->cmd;
-			cmd->type = cmd_sync;
-			cmd->conn = NULL;
-			push_command(-1, data->pathIndex, data->pd, item);
-			wcount = 0;
+			if (cmd->type == cmd_write)
+			{
+				u32 resp;
+				resp = reserve_write(data, item);
+				cmd->answer = enif_make_uint(item->env, resp);
+				respond_cmd(data, item);
+				++wcount;
+			}
+			else if (cmd->type == cmd_set_socket)
+			{
+				cmd->answer = do_set_socket(cmd, data, item->env);
+				respond_cmd(data, item);
+			}
+			else if (cmd->type == cmd_stop)
+			{
+				respond_cmd(data, item);
+				break;
+			}
+
+			item = NULL;
+			if (wcount <= MAX_WRITES)
+				item = queue_trypop(data->tasks);
+
+			if (item == NULL)
+			{
+				item = command_create(-1, data->pathIndex, data->pd);
+				cmd = (db_command*)item->cmd;
+				cmd->type = cmd_sync;
+				cmd->conn = NULL;
+				push_command(-1, data->pathIndex, data->pd, item);
+				wcount = 0;
+				item = NULL;
+			}
 		}
+
+		
 	}
 	DBG("wthread done");
 
@@ -919,6 +926,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	atom_compr = enif_make_atom(env, "compression");
 	atom_tcpfail = enif_make_atom(env, "tcpfail");
 	atom_drivername = enif_make_atom(env, "aqdrv");
+	atom_again = enif_make_atom(env, "again");
 
 	connection_type = enif_open_resource_type(env, NULL, "connection_type",
 		destruct_connection, ERL_NIF_RT_CREATE, NULL);
