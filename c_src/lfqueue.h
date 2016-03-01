@@ -24,9 +24,11 @@
 		mach_timebase_info(&timeinfo); \
 		DIFF = ((STOP-START)*timeinfo.numer)/timeinfo.denom
 #else
+	// #define _POSIX_C_SOURCE 199309L
 	#include <semaphore.h>
+	#include <time.h>
 	#define SEMAPHORE sem_t
-	#define SEM_INIT(X) sem_init(&X)
+	#define SEM_INIT(X) sem_init(&X, 0, 0)
 	#define SEM_WAIT(X) sem_wait(&X)
 	#define SEM_POST(X) sem_post(&X)
 	#define SEM_DESTROY(X) sem_destroy(&X)

@@ -721,11 +721,14 @@ static void *wthread(void *arg)
 			if (item == NULL)
 			{
 				item = command_create(-1, data->pathIndex, data->pd);
-				cmd = (db_command*)item->cmd;
-				cmd->type = cmd_sync;
-				cmd->conn = NULL;
-				push_command(-1, data->pathIndex, data->pd, item);
-				wcount = 0;
+				if (item)
+				{
+					cmd = (db_command*)item->cmd;
+					cmd->type = cmd_sync;
+					cmd->conn = NULL;
+					push_command(-1, data->pathIndex, data->pd, item);
+					wcount = 0;
+				}
 				item = NULL;
 			}
 		}
@@ -745,7 +748,7 @@ static qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
 	int i;
 	qfile *file = calloc(1, sizeof(qfile));
 	
-	sprintf(filename, "%s/%lld", priv->paths[pathIndex], logIndex);
+	sprintf(filename, "%s/%lld",priv->paths[pathIndex], (long long int)logIndex);
 	file->fd = open(filename, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP);
 	if (file->fd > 0)
 	{
