@@ -4,40 +4,7 @@
 #ifndef _TESTAPP_
 #include "erl_nif.h"
 #endif
-
-#ifndef _WIN32
-#include <pthread.h>
-#endif
-
-#if defined(__APPLE__)
-	#include <libkern/OSAtomic.h>
-	#define MemoryBarrier OSMemoryBarrier
-	#include <dispatch/dispatch.h>
-	#define SEMAPHORE dispatch_semaphore_t
-	#define SEM_INIT(X) X = dispatch_semaphore_create(0)
-	#define SEM_WAIT(X) dispatch_semaphore_wait(X, DISPATCH_TIME_FOREVER)
-	#define SEM_POST(X) dispatch_semaphore_signal(X)
-	#define SEM_DESTROY(X) dispatch_release(X)
-	#define TIME uint64_t
-	#define GETTIME(X) X = mach_absolute_time()
-	#define NANODIFF(STOP,START,DIFF) mach_timebase_info_data_t timeinfo; \
-		mach_timebase_info(&timeinfo); \
-		DIFF = ((STOP-START)*timeinfo.numer)/timeinfo.denom
-#else
-	// #define _POSIX_C_SOURCE 199309L
-	#include <semaphore.h>
-	#include <time.h>
-	#define SEMAPHORE sem_t
-	#define SEM_INIT(X) sem_init(&X, 0, 0)
-	#define SEM_WAIT(X) sem_wait(&X)
-	#define SEM_POST(X) sem_post(&X)
-	#define SEM_DESTROY(X) sem_destroy(&X)
-	#define TIME struct timespec
-	#define GETTIME(X) clock_gettime(CLOCK_MONOTONIC, &X)
-	#define NANODIFF(STOP,START,DIFF) \
-	 DIFF = ((STOP.tv_sec * 1000000000UL) + STOP.tv_nsec) - \
-	 ((START.tv_sec * 1000000000UL) + START.tv_nsec)
-#endif
+#include "platform.h"
 
 typedef struct queue_t queue;
 typedef struct qitem_t qitem;
@@ -78,6 +45,7 @@ void queue_destroy(queue *queue);
 int queue_push(queue *queue, qitem* item);
 qitem* queue_pop(queue *queue);
 qitem* queue_trypop(queue *queue);
+qitem* queue_timepop(queue *queue, uint32_t miliseconds);
 
 void queue_recycle(queue *queue, qitem* item);
 qitem* queue_get_item(queue *queue);

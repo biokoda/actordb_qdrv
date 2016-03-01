@@ -1,15 +1,8 @@
-#include <assert.h>
-#include <stdio.h>
-#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include "lfqueue.h"
-#include <stdatomic.h>
 #include <sched.h>
 #define BLOCK_SIZE 512
-#if defined(__APPLE__)
-#include <mach/mach_time.h>
-#endif
 
 #ifdef _WIN32
 #define __thread __declspec( thread )
@@ -93,6 +86,20 @@ qitem* queue_trypop(queue *queue)
 	return qpop(&queue->q);
 }
 
+qitem* queue_timepop(queue *queue, uint32_t miliseconds)
+{
+	qitem *r = qpop(&queue->q);
+	if (r)
+		return r;
+	else
+	{
+		if (SEM_TIMEDWAIT(queue->sem, miliseconds) != 0)
+			return NULL;
+		else
+			return qpop(&queue->q);
+	}
+}
+
 qitem* queue_pop(queue *queue)
 {
 	qitem *r = qpop(&queue->q);
@@ -102,9 +109,10 @@ qitem* queue_pop(queue *queue)
 	{
 		TIME start;
 		GETTIME(start);
+		INITTIME;
 		while (1)
 		{
-			uint64_t diff;
+			u64 diff;
 			TIME stop;
 			sched_yield();
 			GETTIME(stop);

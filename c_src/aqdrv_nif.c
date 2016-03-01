@@ -19,6 +19,8 @@
 #include <errno.h>
 #include "aqdrv_nif.h"
 
+// Every new write is aligned to this.
+#define WRITE_ALIGNMENT 1024
 #define PGSZ 4096
 #define HEADER_SPACE 10
 
@@ -534,44 +536,63 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 	return rc;
 }
 
-static u32 reserve_write(thrinf *data, qitem *item)
+static qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
+{
+	char filename[128];
+	int i;
+	qfile *file = calloc(1, sizeof(qfile));
+	
+	sprintf(filename, "%s/%lld",priv->paths[pathIndex], (long long int)logIndex);
+	file->fd = open(filename, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP);
+	if (file->fd > 0)
+	{
+		ftruncate(file->fd, FILE_LIMIT);
+		file->wmap = mmap(NULL, FILE_LIMIT, PROT_WRITE | PROT_READ, MAP_SHARED, file->fd, 0);
+	}
+	else
+	{
+		close(file->fd);
+		free(file);
+		return NULL;
+	}
+	file->getMtx = enif_mutex_create("getmtx");
+	file->logIndex = logIndex;
+	for (i = 0; i < priv->nThreads; i++)
+		atomic_init(&file->thrPositions[i],0);
+	atomic_init(&file->reservePos, 0);
+	atomic_init(&file->refc, 0);
+	priv->headFile[pathIndex] = file;
+	return file;
+}
+
+static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 {
 	qfile *curFile = data->curFile;
-	u32 writePos = FILE_LIMIT;
+	u64 writePos = FILE_LIMIT;
 	u32 size;
-	u8 movedForward = 0, waiting = 0;
 	db_command *cmd = (db_command*)item->cmd;
 
 	size = cmd->conn->data.writeSize + cmd->conn->map.writeSize + cmd->conn->headerSize;
 
-	if (size > PGSZ)
+	if (size > 1024)
 	{
 		// page alignment
-		if (size % PGSZ)
-			size += (PGSZ - (size % PGSZ));
+		if (size % 1024)
+			size += (1024 - (size % 1024));
 	}
 	else
-		size = PGSZ;
+		size = 1024;
+
+	INITTIME;
+	TIME start;
+	TIME stop;
+	
 
 	while (1)
 	{
-		if (!waiting)
-			writePos = atomic_fetch_add(&curFile->reservePos, size);
-		else
-		{
-			// If we are waiting for space to become available
-			// we must not overflow reservePos.
-			writePos = atomic_load(&curFile->reservePos);
-			if ((writePos + size) < FILE_LIMIT)
-			{
-				waiting = 0;
-				continue;
-			}
-		}
+		writePos = atomic_fetch_add(&curFile->reservePos, size);
 		if ((writePos + size) < FILE_LIMIT)
 		{
-			if (movedForward)
-				atomic_fetch_add(&curFile->refc, 1);
 			break;
 		}
 		else
@@ -580,28 +601,25 @@ static u32 reserve_write(thrinf *data, qitem *item)
 			while (enif_mutex_trylock(curFile->getMtx) != 0)
 			{
 			}
-			if (curFile->next)
 			{
-				if (!movedForward)
+				if (!curFile->next)
 				{
-					atomic_fetch_sub(&curFile->refc, 1);
-					movedForward = 1;
+					qfile *nf = open_file(curFile->logIndex + 1, data->pathIndex, data->pd);
+					// printf("Opened new file! %lld\n",nf->logIndex);
+					curFile->next = nf;
 				}
+				atomic_fetch_sub(&curFile->refc, 1);
 				data->curFile = curFile = curFile->next;
-				waiting = 0;
+				atomic_fetch_add(&curFile->refc, 1);
 			}
-			else
-				waiting = 1;
 			enif_mutex_unlock(curFile->getMtx);
-			if (waiting)
-			{
-				usleep(100);
-			}
 			DBG("Moving? %d curfile=%lld",(int)waiting, curFile->logIndex);
 		}
 	}
-
+	GETTIME(start);
 	do_pwrite(data, cmd->conn, writePos);
+	GETTIME(stop);
+	NANODIFF(stop, start, (*diff));
 
 	// if (endPos % (1024*1024*10) == 0)
 	DBG("writePos=%u, endPos=%u, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
@@ -681,25 +699,33 @@ static void *wthread(void *arg)
 	thrinf* data = (thrinf*)arg;
 	int wcount = 0;
 
-#ifdef __APPLE__
-	mach_timebase_info_data_t info;
-	mach_timebase_info(&info);
-#endif
+	INITTIME;
+	// TIME syncSent;
+	// GETTIME(syncSent);
 
 	while (1)
 	{
 		qitem *item = queue_pop(data->tasks);
 
 		// DBG("wthr do=%d, curfile=%lld",cmd->type, data->curFile->logIndex);
-		while (item)
+		// while (item)
 		{
 			db_command *cmd;
 			cmd = (db_command*)item->cmd;
 			if (cmd->type == cmd_write)
 			{
 				u32 resp;
-				resp = reserve_write(data, item);
-				cmd->answer = enif_make_uint(item->env, resp);
+				
+				// TIME stop;
+				u64 diff;
+				// GETTIME(start);
+				resp = reserve_write(data, item, &diff);
+				// GETTIME(stop);
+				// NANODIFF(stop, start, diff);
+				// cmd->answer = enif_make_uint(item->env, resp);
+				cmd->answer = enif_make_tuple2(item->env, 
+					enif_make_uint(item->env, resp),
+					enif_make_uint64(item->env, diff));
 				respond_cmd(data, item);
 				++wcount;
 			}
@@ -713,27 +739,7 @@ static void *wthread(void *arg)
 				respond_cmd(data, item);
 				break;
 			}
-
-			item = NULL;
-			if (wcount <= MAX_WRITES)
-				item = queue_trypop(data->tasks);
-
-			if (item == NULL)
-			{
-				item = command_create(-1, data->pathIndex, data->pd);
-				if (item)
-				{
-					cmd = (db_command*)item->cmd;
-					cmd->type = cmd_sync;
-					cmd->conn = NULL;
-					push_command(-1, data->pathIndex, data->pd, item);
-					wcount = 0;
-				}
-				item = NULL;
-			}
 		}
-
-		
 	}
 	DBG("wthread done");
 
@@ -742,53 +748,27 @@ static void *wthread(void *arg)
 	return NULL;
 }
 
-static qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
-{
-	char filename[128];
-	int i;
-	qfile *file = calloc(1, sizeof(qfile));
-	
-	sprintf(filename, "%s/%lld",priv->paths[pathIndex], (long long int)logIndex);
-	file->fd = open(filename, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP);
-	if (file->fd > 0)
-	{
-		ftruncate(file->fd, FILE_LIMIT);
-		file->wmap = mmap(NULL, FILE_LIMIT, PROT_WRITE | PROT_READ, MAP_SHARED, file->fd, 0);
-	}
-	else
-	{
-		close(file->fd);
-		free(file);
-		return NULL;
-	}
-	file->getMtx = enif_mutex_create("getmtx");
-	file->logIndex = logIndex;
-	for (i = 0; i < priv->nThreads; i++)
-		atomic_init(&file->thrPositions[i],0);
-	atomic_init(&file->reservePos, 0);
-	atomic_init(&file->refc, 0);
-	priv->headFile[pathIndex] = file;
-	return file;
-}
-
 static void *sthread(void *arg)
 {
 	thrinf* data = (thrinf*)arg;
 	const int nThreads = data->pd->nThreads;
+	int twait = 100;
+	INITTIME;
 
 	while (1)
 	{
 		int i;
 		char threadsSeen = 0;
 		qfile *curFile = data->curFile;
-		db_command *cmd;
+		db_command *cmd = NULL;
 		qitem *itemsWaiting = NULL;
-		qitem *item = queue_pop(data->tasks);
-		cmd 		= (db_command*)item->cmd;
+		qitem *item = queue_timepop(data->tasks,MIN(twait,100));
+		if (item != NULL)
+			cmd = (db_command*)item->cmd;
 
 		DBG("syncthr do=%d, curfile=%lld",cmd->type, curFile->logIndex);
 
-		if (cmd->conn)
+		if (cmd && cmd->conn)
 		{
 			cmd->answer = atom_ok;
 			if (cmd->conn->lastWpos <= cmd->conn->lastFile->syncPositions[cmd->conn->thread])
@@ -803,13 +783,13 @@ static void *sthread(void *arg)
 		while (1)
 		{
 			u32 highestPos = 0, syncFrom = ~0;
-			char curRefc = atomic_load(&curFile->refc);
-			u32 curReservePos = atomic_load(&curFile->reservePos);
+			char curRefc = atomic_load_explicit(&curFile->refc,memory_order_relaxed);
+			u32 curReservePos = atomic_load_explicit(&curFile->reservePos,memory_order_relaxed);
 			threadsSeen += curRefc;
 
 			for (i = 0; i < nThreads; i++)
 			{
-				u32 pos = atomic_load(&curFile->thrPositions[i]);
+				u32 pos = atomic_load_explicit(&curFile->thrPositions[i],memory_order_relaxed);
 				// syncFrom is lowest previously synced position.
 				syncFrom = (curFile->syncPositions[i] < syncFrom ? curFile->syncPositions[i] : syncFrom);
 				if (curFile->syncPositions[i] != pos)
@@ -822,7 +802,12 @@ static void *sthread(void *arg)
 
 			if (syncFrom < highestPos)
 			{
-				DBG("sync from=%u, to=%u, refc=%d",syncFrom, highestPos, (int)curRefc);
+				DBG("sync from=%u, to=%u, refc=%d",
+					syncFrom, highestPos, (int)curRefc);
+				TIME start;
+				TIME stop;
+				u64 diff;
+				GETTIME(start);
 				#if defined(__APPLE__) || defined(_WIN32)
 					fsync(curFile->fd);
 				#elif defined(__linux__)
@@ -831,18 +816,25 @@ static void *sthread(void *arg)
 				#else
 					fdatasync(curFile->fd);
 				#endif
-			}
 
-			if (curReservePos > 0 && curFile->next == NULL)
-			{
-				qfile *nf = open_file(curFile->logIndex + 1, data->pathIndex, data->pd);
-				DBG("Opened new file!");
-				while (enif_mutex_trylock(curFile->getMtx) != 0)
-				{
-				}
-				curFile->next = nf;
-				enif_mutex_unlock(curFile->getMtx);
+				GETTIME(stop);
+				NANODIFF(stop, start, diff);
+				// for (i = 0; i < nThreads; i++)
+				// 	printf("thr=%d, pos=%umb\n",i, curFile->syncPositions[i] / (1024*1024));
+				// printf("SYNC refc=%d, time=%llums, syncFrom=%u, syncTo=%u findex=%llu\n",
+				// 	curRefc,
+				// 	diff / MS(1),
+				// 	syncFrom, 
+				// 	highestPos,
+				// 	curFile->logIndex);
+
+				if (diff > 100)
+					twait = 0;
+				else
+					twait = 100-diff;
 			}
+			else
+				twait = 100;
 
 			// If refc==0 we can safely move forward.
 			if (curRefc == 0 && curReservePos > 0 && curFile->next != NULL)
@@ -852,9 +844,11 @@ static void *sthread(void *arg)
 			}
 			else if (threadsSeen >= nThreads)
 			{
-				for (i = 0; i < nThreads; i++)
-					DBG("thr=%d, pos=%u",i, curFile->syncPositions[i]);
-				DBG("Seen enough");
+				// #ifdef _TESTDBG_
+				// for (i = 0; i < nThreads; i++)
+				// 	DBG("thr=%d, pos=%u",i, curFile->syncPositions[i]);
+				// DBG("Seen enough");
+				// #endif
 				break;
 			}
 			else if (curFile->next)
@@ -863,12 +857,12 @@ static void *sthread(void *arg)
 				break;
 		}
 
-		if (cmd->conn)
+		if (cmd && cmd->conn)
 		{
 			item->next = itemsWaiting;
 			itemsWaiting = item;
 		}
-		else
+		else if (item)
 			respond_cmd(data, item);
 
 		// Respond to all sync commands that have been waiting for this chunk of file.
@@ -895,7 +889,7 @@ static void *sthread(void *arg)
 			}
 		}
 
-		if (cmd->type == cmd_stop)
+		if (cmd && cmd->type == cmd_stop)
 			break;
 	}
 
