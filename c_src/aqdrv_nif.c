@@ -19,8 +19,9 @@
 #include <errno.h>
 #include "aqdrv_nif.h"
 
+// Every new write is aligned to this.
+#define WRITE_ALIGNMENT 1024
 #define PGSZ 4096
-#define HEADER_SPACE 10
 
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_false;
@@ -32,7 +33,11 @@ static ERL_NIF_TERM atom_paths;
 static ERL_NIF_TERM atom_compr;
 static ERL_NIF_TERM atom_tcpfail;
 static ERL_NIF_TERM atom_drivername;
+static ERL_NIF_TERM atom_again;
+static ERL_NIF_TERM atom_schedulers;
 static ErlNifResourceType *connection_type;
+
+FILE *g_log = NULL;
 
 static const LZ4F_preferences_t lz4Prefs = {
 	{ LZ4F_max64KB, LZ4F_blockIndependent, LZ4F_contentChecksumEnabled, LZ4F_frame, 0, { 0, 0 } },
@@ -59,6 +64,7 @@ static void writeUint32LE(u8 *p, u32 v)
 static void destruct_connection(ErlNifEnv *env, void *arg)
 {
 	coninf *r = (coninf*)arg;
+	DBG("Destruct conn");
 	LZ4F_freeCompressionContext(r->map.cctx);
 	LZ4F_freeCompressionContext(r->data.cctx);
 	free(r->map.buf);
@@ -74,15 +80,17 @@ static ERL_NIF_TERM make_error_tuple(ErlNifEnv *env, const char *reason)
 
 static qitem* command_create(int thread, int syncThread, priv_data *p)
 {
-	queue *thrCmds = NULL;
+	// queue *thrCmds = NULL;
 	qitem *item;
 
-	if (syncThread == -1)
-		thrCmds = p->tasks[thread];
-	else
-		thrCmds = p->syncTasks[syncThread];
+	// if (syncThread == -1)
+	// 	thrCmds = p->tasks[thread];
+	// else
+	// 	thrCmds = p->syncTasks[syncThread];
 
-	item = queue_get_item(thrCmds);
+	item = queue_get_item();
+	if (!item)
+		return NULL;
 	if (item->cmd == NULL)
 	{
 		item->cmd = enif_alloc(sizeof(db_command));
@@ -108,7 +116,7 @@ static ERL_NIF_TERM push_command(int thread, int syncThread, priv_data *pd, qite
 	return atom_ok;
 }
 
-static ERL_NIF_TERM set_tunnel_connector(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM q_set_tunnel_connector(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	priv_data *pd = (priv_data*)enif_priv_data(env);
 
@@ -117,7 +125,7 @@ static ERL_NIF_TERM set_tunnel_connector(ErlNifEnv *env, int argc, const ERL_NIF
 	return atom_ok;
 }
 
-static ERL_NIF_TERM set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM q_set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	int thread, fd, type, pos;
 	qitem *item;
@@ -137,6 +145,11 @@ static ERL_NIF_TERM set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 		return atom_false;
 
 	item = command_create(thread,-1,pd);
+	if (!item)
+	{
+		DBG("Returning again!");
+		return atom_again;
+	}
 	cmd = (db_command*)item->cmd;
 	cmd->type = cmd_set_socket;
 	cmd->arg = enif_make_int(item->env,fd);
@@ -405,6 +418,13 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	if (!enif_is_list(env, argv[4]))
 		return make_error_tuple(env, "missing header iolist");
 
+	item = command_create(res->thread, -1, pd);
+	if (!item)
+	{
+		DBG("Returning again!");
+		return atom_again;
+	}
+
 	// Replication data is prepended to header (it is not written to disk)
 	res->replSize = list_to_bin(res->header, HDRMAX, env, argv[3]);
 	if (!res->replSize)
@@ -422,7 +442,6 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	res->headerSize += 8;
 
 	enif_keep_resource(res);
-	item = command_create(res->thread, -1, pd);
 	cmd = (db_command*)item->cmd;
 	cmd->type = cmd_write;
 	cmd->ref = enif_make_copy(item->env, argv[0]);
@@ -433,8 +452,25 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	return push_command(res->thread, -1, pd, item);
 }
 
+static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	priv_data *pd = (priv_data*)enif_priv_data(env);
+	qitem *it;
+	int n;
+	if (argc != 1)
+		return atom_false;
 
-static ERL_NIF_TERM replicate_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+	if (!enif_get_int(env, argv[0], &n))
+		return atom_false;
+
+	it = queue_get_item();
+	pd->schQueues[n] = it->home;
+	queue_recycle(it);
+
+	return atom_ok;
+}
+
+static ERL_NIF_TERM q_replicate_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	coninf *res;
 	ErlNifBinary bin;
@@ -550,44 +586,61 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 	return rc;
 }
 
-static u32 reserve_write(thrinf *data, qitem *item)
+static qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
+{
+	char filename[128];
+	int i;
+	qfile *file = calloc(1, sizeof(qfile));
+	
+	sprintf(filename, "%s/%lld",priv->paths[pathIndex], (long long int)logIndex);
+	file->fd = open(filename, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP);
+	if (file->fd > 0)
+	{
+		ftruncate(file->fd, FILE_LIMIT);
+		file->wmap = mmap(NULL, FILE_LIMIT, PROT_WRITE | PROT_READ, MAP_SHARED, file->fd, 0);
+	}
+	else
+	{
+		close(file->fd);
+		free(file);
+		return NULL;
+	}
+	file->getMtx = enif_mutex_create("getmtx");
+	file->logIndex = logIndex;
+	for (i = 0; i < priv->nThreads; i++)
+		atomic_init(&file->thrPositions[i],0);
+	atomic_init(&file->reservePos, 0);
+	atomic_init(&file->refc, 0);
+	priv->headFile[pathIndex] = file;
+	return file;
+}
+
+static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 {
 	qfile *curFile = data->curFile;
-	u32 writePos = FILE_LIMIT;
+	u64 writePos = FILE_LIMIT;
 	u32 size;
-	u8 movedForward = 0, waiting = 0;
 	db_command *cmd = (db_command*)item->cmd;
 
 	size = cmd->conn->data.writeSize + cmd->conn->map.writeSize + cmd->conn->headerSize;
 
-	if (size > PGSZ)
+	if (size > WRITE_ALIGNMENT)
 	{
-		// page alignment
-		if (size % PGSZ)
-			size += (PGSZ - (size % PGSZ));
+		if (size % WRITE_ALIGNMENT)
+			size += (WRITE_ALIGNMENT - (size % WRITE_ALIGNMENT));
 	}
 	else
-		size = PGSZ;
+		size = WRITE_ALIGNMENT;
+
+	INITTIME;
+	TIME start;
+	TIME stop;
 
 	while (1)
 	{
-		if (!waiting)
-			writePos = atomic_fetch_add(&curFile->reservePos, size);
-		else
-		{
-			// If we are waiting for space to become available
-			// we must not overflow reservePos.
-			writePos = atomic_load(&curFile->reservePos);
-			if ((writePos + size) < FILE_LIMIT)
-			{
-				waiting = 0;
-				continue;
-			}
-		}
+		writePos = atomic_fetch_add(&curFile->reservePos, size);
 		if ((writePos + size) < FILE_LIMIT)
 		{
-			if (movedForward)
-				atomic_fetch_add(&curFile->refc, 1);
 			break;
 		}
 		else
@@ -596,31 +649,28 @@ static u32 reserve_write(thrinf *data, qitem *item)
 			while (enif_mutex_trylock(curFile->getMtx) != 0)
 			{
 			}
-			if (curFile->next)
 			{
-				if (!movedForward)
+				if (!curFile->next)
 				{
-					atomic_fetch_sub(&curFile->refc, 1);
-					movedForward = 1;
+					qfile *nf = open_file(curFile->logIndex + 1, data->pathIndex, data->pd);
+					// printf("Opened new file! %lld\n",nf->logIndex);
+					curFile->next = nf;
 				}
+				atomic_fetch_sub(&curFile->refc, 1);
 				data->curFile = curFile = curFile->next;
-				waiting = 0;
+				atomic_fetch_add(&curFile->refc, 1);
 			}
-			else
-				waiting = 1;
 			enif_mutex_unlock(curFile->getMtx);
-			if (waiting)
-			{
-				usleep(100);
-			}
-			DBG("Moving? %d curfile=%lld",(int)waiting, curFile->logIndex);
+			DBG("Moving? curfile=%lld", curFile->logIndex);
 		}
 	}
-
+	GETTIME(start);
 	do_pwrite(data, cmd->conn, writePos);
+	GETTIME(stop);
+	NANODIFF(stop, start, (*diff));
 
 	// if (endPos % (1024*1024*10) == 0)
-	DBG("writePos=%u, endPos=%u, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
+	DBG("writePos=%llu, endPos=%llu, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
 
 	cmd->conn->lastFile = curFile;
 	cmd->conn->lastWpos = writePos+size;
@@ -689,7 +739,7 @@ static void respond_cmd(thrinf *data, qitem *item)
 	{
 		enif_release_resource(cmd->conn);
 	}
-	queue_recycle(data->tasks,item);
+	queue_recycle(item);
 }
 
 static void *wthread(void *arg)
@@ -697,64 +747,46 @@ static void *wthread(void *arg)
 	thrinf* data = (thrinf*)arg;
 	int wcount = 0;
 
-#ifdef __APPLE__
-	mach_timebase_info_data_t info;
-	mach_timebase_info(&info);
-#endif
+	INITTIME;
+	// TIME syncSent;
+	// GETTIME(syncSent);
 
 	while (1)
 	{
-		db_command *cmd;
 		qitem *item = queue_pop(data->tasks);
-		cmd = (db_command*)item->cmd;
 
 		// DBG("wthr do=%d, curfile=%lld",cmd->type, data->curFile->logIndex);
-
-		if (cmd->type == cmd_write)
+		// while (item)
 		{
-			u32 resp;
-			// u64 diff1;
-			// u64 diff = 0, setupDiff = 0, diff1 = 0;
-		// #ifdef __APPLE__
-		// 	u64 start = mach_absolute_time();
-		// 	resp = reserve_write(data, item);
-		// 	u64 stop = mach_absolute_time();
-		// 	diff1 = (stop-start);
-		// 	diff1 *= info.numer;
-		// 	diff1 /= info.denom;
-		// #else
-		// 	struct timespec start;
-		// 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
-		//  resp = reserve_write(data, item);
-		// 	struct timespec stop;
-		// 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &stop);
-		// 	diff1 = ((stop.tv_sec * 1000000000UL) + stop.tv_nsec) - ((start.tv_sec * 1000000000UL) + start.tv_nsec);
-		// #endif
-
-			resp = reserve_write(data, item);
-			cmd->answer = enif_make_uint(item->env, resp);
-			respond_cmd(data, item);
-			++wcount;
-		}
-		else if (cmd->type == cmd_set_socket)
-		{
-			cmd->answer = do_set_socket(cmd, data, item->env);
-			respond_cmd(data, item);
-		}
-		else if (cmd->type == cmd_stop)
-		{
-			respond_cmd(data, item);
-			break;
-		}
-
-		if (wcount >= MAX_WRITES || queue_size(data->tasks) == 0)
-		{
-			item = command_create(-1, data->pathIndex, data->pd);
+			db_command *cmd;
 			cmd = (db_command*)item->cmd;
-			cmd->type = cmd_sync;
-			cmd->conn = NULL;
-			push_command(-1, data->pathIndex, data->pd, item);
-			wcount = 0;
+			if (cmd->type == cmd_write)
+			{
+				u32 resp;
+				
+				// TIME stop;
+				u64 diff;
+				// GETTIME(start);
+				resp = reserve_write(data, item, &diff);
+				// GETTIME(stop);
+				// NANODIFF(stop, start, diff);
+				// cmd->answer = enif_make_uint(item->env, resp);
+				cmd->answer = enif_make_tuple2(item->env, 
+					enif_make_uint(item->env, resp),
+					enif_make_uint64(item->env, diff));
+				respond_cmd(data, item);
+				++wcount;
+			}
+			else if (cmd->type == cmd_set_socket)
+			{
+				cmd->answer = do_set_socket(cmd, data, item->env);
+				respond_cmd(data, item);
+			}
+			else if (cmd->type == cmd_stop)
+			{
+				respond_cmd(data, item);
+				break;
+			}
 		}
 	}
 	DBG("wthread done");
@@ -764,53 +796,27 @@ static void *wthread(void *arg)
 	return NULL;
 }
 
-static qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
-{
-	char filename[128];
-	int i;
-	qfile *file = calloc(1, sizeof(qfile));
-	
-	sprintf(filename, "%s/%lld", priv->paths[pathIndex], logIndex);
-	file->fd = open(filename, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP);
-	if (file->fd > 0)
-	{
-		ftruncate(file->fd, FILE_LIMIT);
-		file->wmap = mmap(NULL, FILE_LIMIT, PROT_WRITE | PROT_READ, MAP_SHARED, file->fd, 0);
-	}
-	else
-	{
-		close(file->fd);
-		free(file);
-		return NULL;
-	}
-	file->getMtx = enif_mutex_create("getmtx");
-	file->logIndex = logIndex;
-	for (i = 0; i < priv->nThreads; i++)
-		atomic_init(&file->thrPositions[i],0);
-	atomic_init(&file->reservePos, 0);
-	atomic_init(&file->refc, 0);
-	priv->headFile[pathIndex] = file;
-	return file;
-}
-
 static void *sthread(void *arg)
 {
 	thrinf* data = (thrinf*)arg;
 	const int nThreads = data->pd->nThreads;
+	int twait = 100;
+	INITTIME;
 
 	while (1)
 	{
 		int i;
 		char threadsSeen = 0;
 		qfile *curFile = data->curFile;
-		db_command *cmd;
+		db_command *cmd = NULL;
 		qitem *itemsWaiting = NULL;
-		qitem *item = queue_pop(data->tasks);
-		cmd 		= (db_command*)item->cmd;
+		qitem *item = queue_timepop(data->tasks,MIN(twait,100));
+		if (item != NULL)
+			cmd = (db_command*)item->cmd;
 
 		DBG("syncthr do=%d, curfile=%lld",cmd->type, curFile->logIndex);
 
-		if (cmd->conn)
+		if (cmd && cmd->conn)
 		{
 			cmd->answer = atom_ok;
 			if (cmd->conn->lastWpos <= cmd->conn->lastFile->syncPositions[cmd->conn->thread])
@@ -825,13 +831,13 @@ static void *sthread(void *arg)
 		while (1)
 		{
 			u32 highestPos = 0, syncFrom = ~0;
-			char curRefc = atomic_load(&curFile->refc);
-			u32 curReservePos = atomic_load(&curFile->reservePos);
+			char curRefc = atomic_load_explicit(&curFile->refc,memory_order_relaxed);
+			u32 curReservePos = atomic_load_explicit(&curFile->reservePos,memory_order_relaxed);
 			threadsSeen += curRefc;
 
 			for (i = 0; i < nThreads; i++)
 			{
-				u32 pos = atomic_load(&curFile->thrPositions[i]);
+				u32 pos = atomic_load_explicit(&curFile->thrPositions[i],memory_order_relaxed);
 				// syncFrom is lowest previously synced position.
 				syncFrom = (curFile->syncPositions[i] < syncFrom ? curFile->syncPositions[i] : syncFrom);
 				if (curFile->syncPositions[i] != pos)
@@ -844,27 +850,40 @@ static void *sthread(void *arg)
 
 			if (syncFrom < highestPos)
 			{
-				DBG("sync from=%u, to=%u, refc=%d",syncFrom, highestPos, (int)curRefc);
-				#if defined(__APPLE__) || defined(_WIN32)
-					fsync(curFile->fd);
-				#elif defined(__linux__)
-					sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
-						SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
-				#else
-					fdatasync(curFile->fd);
-				#endif
-			}
+				DBG("sync from=%u, to=%u, refc=%d",
+					syncFrom, highestPos, (int)curRefc);
+				TIME start;
+				TIME stop;
+				u64 diff = 0;
+				GETTIME(start);
+				// #if defined(__APPLE__) || defined(_WIN32)
+				// 	fsync(curFile->fd);
+				// #elif defined(__linux__)
+				// 	sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
+				// 		SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
+				// #else
+				// 	fdatasync(curFile->fd);
+				// #endif
 
-			if (curReservePos > 0 && curFile->next == NULL)
-			{
-				qfile *nf = open_file(curFile->logIndex + 1, data->pathIndex, data->pd);
-				DBG("Opened new file!");
-				while (enif_mutex_trylock(curFile->getMtx) != 0)
-				{
-				}
-				curFile->next = nf;
-				enif_mutex_unlock(curFile->getMtx);
+				GETTIME(stop);
+				// NANODIFF(stop, start, diff);
+
+				// for (i = 0; i < nThreads; i++)
+				// 	printf("thr=%d, pos=%umb\n",i, curFile->syncPositions[i] / (1024*1024));
+				// printf("SYNC refc=%d, time=%llums, syncFrom=%u, syncTo=%u findex=%llu\n",
+				// 	curRefc,
+				// 	diff / MS(1),
+				// 	syncFrom, 
+				// 	highestPos,
+				// 	curFile->logIndex);
+
+				if (diff > 100)
+					twait = 0;
+				else
+					twait = 100-diff;
 			}
+			else
+				twait = 100;
 
 			// If refc==0 we can safely move forward.
 			if (curRefc == 0 && curReservePos > 0 && curFile->next != NULL)
@@ -874,9 +893,11 @@ static void *sthread(void *arg)
 			}
 			else if (threadsSeen >= nThreads)
 			{
-				for (i = 0; i < nThreads; i++)
-					DBG("thr=%d, pos=%u",i, curFile->syncPositions[i]);
-				DBG("Seen enough");
+				// #ifdef _TESTDBG_
+				// for (i = 0; i < nThreads; i++)
+				// 	DBG("thr=%d, pos=%u",i, curFile->syncPositions[i]);
+				// DBG("Seen enough");
+				// #endif
 				break;
 			}
 			else if (curFile->next)
@@ -885,12 +906,12 @@ static void *sthread(void *arg)
 				break;
 		}
 
-		if (cmd->conn)
+		if (cmd && cmd->conn)
 		{
 			item->next = itemsWaiting;
 			itemsWaiting = item;
 		}
-		else
+		else if (item)
 			respond_cmd(data, item);
 
 		// Respond to all sync commands that have been waiting for this chunk of file.
@@ -917,7 +938,7 @@ static void *sthread(void *arg)
 			}
 		}
 
-		if (cmd->type == cmd_stop)
+		if (cmd && cmd->type == cmd_stop)
 			break;
 	}
 
@@ -951,17 +972,34 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	atom_compr = enif_make_atom(env, "compression");
 	atom_tcpfail = enif_make_atom(env, "tcpfail");
 	atom_drivername = enif_make_atom(env, "aqdrv");
+	atom_again = enif_make_atom(env, "again");
+	atom_schedulers = enif_make_atom(env, "schedulers");
 
 	connection_type = enif_open_resource_type(env, NULL, "connection_type",
 		destruct_connection, ERL_NIF_RT_CREATE, NULL);
 	if(!connection_type)
 		return -1;
 
+	#ifdef _TESTDBG_
+	if (enif_get_map_value(env, info, atom_logname, &value))
+	{
+		char nodename[128];
+		enif_get_string(env,value,nodename,128,ERL_NIF_LATIN1);
+		g_log = fopen(nodename, "w");
+	}
+	#endif
 	if (enif_get_map_value(env, info, atom_wthreads, &value))
 	{
 		if (!enif_get_int(env,value,&priv->nThreads))
 			return -1;
 		priv->nThreads = MIN(MAX_WTHREADS, priv->nThreads);
+	}
+	if (enif_get_map_value(env, info, atom_schedulers, &value))
+	{
+		if (!enif_get_int(env,value,&priv->nSch))
+			return -1;
+		DBG("nschd=%d",priv->nSch);
+		priv->schQueues = calloc(priv->nSch, sizeof(intq*));
 	}
 	if (enif_get_map_value(env, info, atom_startindex, &value))
 	{
@@ -991,14 +1029,6 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 		}
 		priv->doCompr = compr;
 	}
-#ifdef _TESTDBG_
-	if (enif_get_map_value(env, info, atom_logname, &value))
-	{
-		char nodename[128];
-		enif_get_string(env,value,nodename,128,ERL_NIF_LATIN1);
-		g_log = fopen(nodename, "w");
-	}
-#endif
 
 	// priv->lastPos = calloc(priv->nPaths*priv->nThreads, sizeof(atomic_ullong));
 	priv->tasks = calloc(priv->nPaths*priv->nThreads,sizeof(queue*));
@@ -1065,6 +1095,7 @@ static void on_unload(ErlNifEnv* env, void* pd)
 	priv_data *priv = (priv_data*)pd;
 	qitem *item;
 	db_command *cmd = NULL;
+	DBG("on_unload");
 
 	for (i = 0; i < priv->nThreads * priv->nPaths; i++)
 	{
@@ -1101,6 +1132,16 @@ static void on_unload(ErlNifEnv* env, void* pd)
 		// enif_mutex_destroy(priv->frwMtx[i]);
 	}
 
+	for (i = 0; i < priv->nSch; i++)
+	{
+		if (priv->schQueues[i])
+		{
+			DBG("on unload cleaning up %d",i);
+			queue_intq_destroy(priv->schQueues[i]);
+			priv->schQueues[i] = NULL;
+		}
+	}
+
 	// free(priv->frwMtx);
 	free(priv->paths);
 	free(priv->tasks);
@@ -1122,9 +1163,10 @@ static ErlNifFunc nif_funcs[] = {
 	{"stage_data", 3, q_stage_data},
 	{"stage_flush", 1, q_flush},
 	{"write", 5, q_write},
-	{"set_tunnel_connector",0,set_tunnel_connector},
-	{"set_thread_fd",4,set_thread_fd},
-	{"replicate_opts",3,replicate_opts},
+	{"set_tunnel_connector",0,q_set_tunnel_connector},
+	{"set_thread_fd",4,q_set_thread_fd},
+	{"replicate_opts",3,q_replicate_opts},
+	{"init_tls",1,q_init_tls},
 };
 
 ERL_NIF_INIT(aqdrv_nif, nif_funcs, on_load, NULL, NULL, on_unload);

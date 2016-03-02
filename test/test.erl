@@ -1,12 +1,13 @@
 -module(test).
 -include_lib("eunit/include/eunit.hrl").
--define(CFG,#{threads => 3, startindex => {1}, paths => {"./"}, pwrite => 0}).
+-define(CFG,#{wthreads => 3, startindex => {1}, paths => {"./"}, pwrite => 0}).
 -define(INIT,aqdrv:init(?CFG)).
 
 run_test_() ->
 	% [file:delete(Fn) || Fn <- ["1"]],
 	[
 	fun dowrite/0,
+	% fun cleanup/0
 	{timeout,50,fun async/0}
 	].
 
@@ -41,6 +42,13 @@ dowrite() ->
 	file:close(F),
 	ok.
 
+% cleanup() ->
+% 	?debugFmt("Cleanup",[]),
+% 	garbage_collect(),
+% 	true = code:delete(aqdrv_nif),
+% 	true = code:purge(aqdrv_nif),
+% 	ok.
+
 async() ->
 	?debugFmt("Running many async reads/writes for 20s",[]),
 	?INIT,
@@ -71,12 +79,12 @@ w(Con,Counter,[Rand|T],L) ->
 	ok = aqdrv:stage_map(Con, <<"ITEM1">>, 1, byte_size(Rand)),
 	ok = aqdrv:stage_data(Con, Rand),
 	{_,_} = aqdrv:stage_flush(Con),
-	WPos = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
+	{WPos,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
 	case ok of
-		% _ when Time > 1000000 orelse Time2 > 1000000 ->
-		% 	?debugFmt("Time1 ~pms, Time2 ~pms, wpos=~pmb, ~p",[Time div 1000000, Time2 div 1000000, WPos div 1000000, Counter]);
+		% _ when Time > 1000000 ->
+		% 	?debugFmt("Time1 ~pms, wpos=~pmb, ~p",[Time div 1000000, WPos div 1000000, Counter]);
 		%  Pos rem (1024*1024*1) == 0;
-		_ when Counter rem 100 == 0 ->
+		_ when Counter rem 10000 == 0 ->
 			?debugFmt("~pmb, ~p",[WPos div 1000000, Counter]),
 			% ?debugFmt("Offset=~p, diffCpy=~p, diffSetup=~p diffAll=~p",[Pos,Diff1,SetupDiff,Diff2]);
 			ok;
