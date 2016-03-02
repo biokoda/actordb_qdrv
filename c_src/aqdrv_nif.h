@@ -71,6 +71,8 @@ typedef struct priv_data
 	u8 doCompr;
 	ErlNifPid tunnelConnector;
 #endif
+	intq **schQueues;
+	int nSch;
 } priv_data;
 
 typedef struct thrinf

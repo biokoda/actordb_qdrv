@@ -14,7 +14,8 @@ set_tunnel_connector() ->
 set_thread_fd(Thread,Fd,Pos,Type) ->
 	case aqdrv_nif:set_thread_fd(Thread,Fd,Pos,Type) of
 		again ->
-			erlang:yield(),
+			% erlang:yield(),
+			timer:sleep(1),
 			set_thread_fd(Thread, Fd, Pos, Type);
 		Res ->
 			Res
@@ -51,7 +52,8 @@ write({aqdrv,Con}, [_|_] = ReplData, [_|_] = Header) ->
 	Ref = make_ref(),
 	case aqdrv_nif:write(Ref, self(),Con, ReplData, Header) of
 		again ->
-			erlang:yield(),
+			% erlang:yield(),
+			timer:sleep(1),
 			write({aqdrv,Con},ReplData, Header);
 		ok ->
 			receive_answer(Ref)

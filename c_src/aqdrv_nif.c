@@ -34,6 +34,7 @@ static ERL_NIF_TERM atom_compr;
 static ERL_NIF_TERM atom_tcpfail;
 static ERL_NIF_TERM atom_drivername;
 static ERL_NIF_TERM atom_again;
+static ERL_NIF_TERM atom_schedulers;
 static ErlNifResourceType *connection_type;
 
 FILE *g_log = NULL;
@@ -63,6 +64,7 @@ static void writeUint32LE(u8 *p, u32 v)
 static void destruct_connection(ErlNifEnv *env, void *arg)
 {
 	coninf *r = (coninf*)arg;
+	DBG("Destruct conn");
 	LZ4F_freeCompressionContext(r->map.cctx);
 	LZ4F_freeCompressionContext(r->data.cctx);
 	free(r->map.buf);
@@ -77,15 +79,15 @@ static ERL_NIF_TERM make_error_tuple(ErlNifEnv *env, const char *reason)
 
 static qitem* command_create(int thread, int syncThread, priv_data *p)
 {
-	queue *thrCmds = NULL;
+	// queue *thrCmds = NULL;
 	qitem *item;
 
-	if (syncThread == -1)
-		thrCmds = p->tasks[thread];
-	else
-		thrCmds = p->syncTasks[syncThread];
+	// if (syncThread == -1)
+	// 	thrCmds = p->tasks[thread];
+	// else
+	// 	thrCmds = p->syncTasks[syncThread];
 
-	item = queue_get_item(thrCmds);
+	item = queue_get_item();
 	if (!item)
 		return NULL;
 	if (item->cmd == NULL)
@@ -113,7 +115,7 @@ static ERL_NIF_TERM push_command(int thread, int syncThread, priv_data *pd, qite
 	return atom_ok;
 }
 
-static ERL_NIF_TERM set_tunnel_connector(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM q_set_tunnel_connector(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	priv_data *pd = (priv_data*)enif_priv_data(env);
 
@@ -122,7 +124,7 @@ static ERL_NIF_TERM set_tunnel_connector(ErlNifEnv *env, int argc, const ERL_NIF
 	return atom_ok;
 }
 
-static ERL_NIF_TERM set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM q_set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	int thread, fd, type, pos;
 	qitem *item;
@@ -449,8 +451,25 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	return push_command(res->thread, -1, pd, item);
 }
 
+static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	priv_data *pd = (priv_data*)enif_priv_data(env);
+	qitem *it;
+	int n;
+	if (argc != 1)
+		return atom_false;
 
-static ERL_NIF_TERM replicate_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+	if (!enif_get_int(env, argv[0], &n))
+		return atom_false;
+
+	it = queue_get_item();
+	pd->schQueues[n] = it->home;
+	queue_recycle(it);
+
+	return atom_ok;
+}
+
+static ERL_NIF_TERM q_replicate_opts(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	coninf *res;
 	ErlNifBinary bin;
@@ -584,7 +603,6 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 	INITTIME;
 	TIME start;
 	TIME stop;
-	
 
 	while (1)
 	{
@@ -611,7 +629,7 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 				atomic_fetch_add(&curFile->refc, 1);
 			}
 			enif_mutex_unlock(curFile->getMtx);
-			DBG("Moving? %d curfile=%lld",(int)waiting, curFile->logIndex);
+			DBG("Moving? curfile=%lld", curFile->logIndex);
 		}
 	}
 	GETTIME(start);
@@ -620,7 +638,7 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 	NANODIFF(stop, start, (*diff));
 
 	// if (endPos % (1024*1024*10) == 0)
-	DBG("writePos=%u, endPos=%u, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
+	DBG("writePos=%llu, endPos=%llu, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
 
 	cmd->conn->lastFile = curFile;
 	cmd->conn->lastWpos = writePos+size;
@@ -689,7 +707,7 @@ static void respond_cmd(thrinf *data, qitem *item)
 	{
 		enif_release_resource(cmd->conn);
 	}
-	queue_recycle(data->tasks,item);
+	queue_recycle(item);
 }
 
 static void *wthread(void *arg)
@@ -804,19 +822,20 @@ static void *sthread(void *arg)
 					syncFrom, highestPos, (int)curRefc);
 				TIME start;
 				TIME stop;
-				u64 diff;
+				u64 diff = 0;
 				GETTIME(start);
-				#if defined(__APPLE__) || defined(_WIN32)
-					fsync(curFile->fd);
-				#elif defined(__linux__)
-					sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
-						SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
-				#else
-					fdatasync(curFile->fd);
-				#endif
+				// #if defined(__APPLE__) || defined(_WIN32)
+				// 	fsync(curFile->fd);
+				// #elif defined(__linux__)
+				// 	sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
+				// 		SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
+				// #else
+				// 	fdatasync(curFile->fd);
+				// #endif
 
 				GETTIME(stop);
-				NANODIFF(stop, start, diff);
+				// NANODIFF(stop, start, diff);
+
 				// for (i = 0; i < nThreads; i++)
 				// 	printf("thr=%d, pos=%umb\n",i, curFile->syncPositions[i] / (1024*1024));
 				// printf("SYNC refc=%d, time=%llums, syncFrom=%u, syncTo=%u findex=%llu\n",
@@ -922,17 +941,33 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	atom_tcpfail = enif_make_atom(env, "tcpfail");
 	atom_drivername = enif_make_atom(env, "aqdrv");
 	atom_again = enif_make_atom(env, "again");
+	atom_schedulers = enif_make_atom(env, "schedulers");
 
 	connection_type = enif_open_resource_type(env, NULL, "connection_type",
 		destruct_connection, ERL_NIF_RT_CREATE, NULL);
 	if(!connection_type)
 		return -1;
 
+	#ifdef _TESTDBG_
+	if (enif_get_map_value(env, info, atom_logname, &value))
+	{
+		char nodename[128];
+		enif_get_string(env,value,nodename,128,ERL_NIF_LATIN1);
+		g_log = fopen(nodename, "w");
+	}
+	#endif
 	if (enif_get_map_value(env, info, atom_wthreads, &value))
 	{
 		if (!enif_get_int(env,value,&priv->nThreads))
 			return -1;
 		priv->nThreads = MIN(MAX_WTHREADS, priv->nThreads);
+	}
+	if (enif_get_map_value(env, info, atom_schedulers, &value))
+	{
+		if (!enif_get_int(env,value,&priv->nSch))
+			return -1;
+		DBG("nschd=%d",priv->nSch);
+		priv->schQueues = calloc(priv->nSch, sizeof(intq*));
 	}
 	if (enif_get_map_value(env, info, atom_startindex, &value))
 	{
@@ -962,14 +997,6 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 		}
 		priv->doCompr = compr;
 	}
-#ifdef _TESTDBG_
-	if (enif_get_map_value(env, info, atom_logname, &value))
-	{
-		char nodename[128];
-		enif_get_string(env,value,nodename,128,ERL_NIF_LATIN1);
-		g_log = fopen(nodename, "w");
-	}
-#endif
 
 	// priv->lastPos = calloc(priv->nPaths*priv->nThreads, sizeof(atomic_ullong));
 	priv->tasks = calloc(priv->nPaths*priv->nThreads,sizeof(queue*));
@@ -1036,6 +1063,7 @@ static void on_unload(ErlNifEnv* env, void* pd)
 	priv_data *priv = (priv_data*)pd;
 	qitem *item;
 	db_command *cmd = NULL;
+	DBG("on_unload");
 
 	for (i = 0; i < priv->nThreads * priv->nPaths; i++)
 	{
@@ -1072,6 +1100,16 @@ static void on_unload(ErlNifEnv* env, void* pd)
 		// enif_mutex_destroy(priv->frwMtx[i]);
 	}
 
+	for (i = 0; i < priv->nSch; i++)
+	{
+		if (priv->schQueues[i])
+		{
+			DBG("on unload cleaning up %d",i);
+			queue_intq_destroy(priv->schQueues[i]);
+			priv->schQueues[i] = NULL;
+		}
+	}
+
 	// free(priv->frwMtx);
 	free(priv->paths);
 	free(priv->tasks);
@@ -1093,9 +1131,10 @@ static ErlNifFunc nif_funcs[] = {
 	{"stage_data", 3, q_stage_data},
 	{"stage_flush", 1, q_flush},
 	{"write", 5, q_write},
-	{"set_tunnel_connector",0,set_tunnel_connector},
-	{"set_thread_fd",4,set_thread_fd},
-	{"replicate_opts",3,replicate_opts},
+	{"set_tunnel_connector",0,q_set_tunnel_connector},
+	{"set_thread_fd",4,q_set_thread_fd},
+	{"replicate_opts",3,q_replicate_opts},
+	{"init_tls",1,q_init_tls},
 };
 
 ERL_NIF_INIT(aqdrv_nif, nif_funcs, on_load, NULL, NULL, on_unload);

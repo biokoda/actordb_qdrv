@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include "lfqueue.h"
 #include <sched.h>
-#define BLOCK_SIZE 512
+#define BLOCK_SIZE 1024
 
 #ifdef _WIN32
 #define __thread __declspec( thread )
@@ -82,12 +82,6 @@ int queue_push(queue *queue, qitem *entry)
 	return 1;
 }
 
-// Not used. Will be once old queue will no longer be used.
-int queue_size(queue *queue)
-{
-	return 0;
-}
-
 // Return item if available, otherwise NULL.
 qitem* queue_trypop(queue *queue)
 {
@@ -140,7 +134,7 @@ qitem* queue_pop(queue *queue)
 
 // Push entry back to home queue.
 // Called from worker thread to give an entry back to a scheduler thread.
-void queue_recycle(queue *queue,qitem *entry)
+void queue_recycle(qitem *entry)
 {
 	qpush(entry->home, entry);
 }
@@ -172,7 +166,7 @@ static void populate(intq *q)
 // producers are worker threads or scheduler thread itself.
 // We have a fixed number of events that are populated on first call.
 // If return NULL, caller should busy wait, go do something else or sleep.
-qitem* queue_get_item(queue *queue)
+qitem* queue_get_item(void)
 {
 	// qitem *res;
 	if (tls_reuseq == NULL)
@@ -188,6 +182,24 @@ qitem* queue_get_item(queue *queue)
 	// 	return qpop(tls_reuseq);
 	// }
 	// return res;
+}
+
+void queue_intq_destroy(intq *q)
+{
+	qitem *it;
+	if (q == NULL)
+		return;
+	while ((it = qpop(q)))
+	{
+		if (it->blockStart)
+			free(it);
+	}
+	if (q->head)
+	{
+		if (q->head->blockStart)
+			free(q->head);
+	}
+	free(q);
 }
 
 

@@ -47,8 +47,8 @@ qitem* queue_pop(queue *queue);
 qitem* queue_trypop(queue *queue);
 qitem* queue_timepop(queue *queue, uint32_t miliseconds);
 
-void queue_recycle(queue *queue, qitem* item);
-qitem* queue_get_item(queue *queue);
-int queue_size(queue *queue);
+void queue_recycle(qitem* item);
+qitem* queue_get_item(void);
+void queue_intq_destroy(intq *q);
 
 #endif 

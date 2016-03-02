@@ -19,8 +19,12 @@ set_thread_fd(_,_,_,_) ->
 	exit(nif_library_not_loaded).
 replicate_opts(_,_,_) ->
 	exit(nif_library_not_loaded).
+init_tls(_) ->
+	exit(nif_library_not_loaded).
 
 init(Info) ->
+	Schedulers = erlang:system_info(schedulers),
+	LogName = "drv_"++hd(string:tokens(atom_to_list(node()),"@"))++".txt",
 	NifName = "aqdrv_nif",
 	NifFileName = case code:priv_dir(aqdrv) of
 		{error, bad_name} -> filename:join("priv", NifName);
@@ -32,11 +36,16 @@ init(Info) ->
 		_ ->
 			FN = NifFileName
 	end,
-	case erlang:load_nif(FN, Info#{logname => "drv_"++hd(string:tokens(atom_to_list(node()),"@"))++".txt"}) of
+	case erlang:load_nif(FN, Info#{schedulers => Schedulers,logname => LogName}) of
 		ok ->
-			ok;
+			init_tls();
 		{error,{upgrade,_}} ->
 			ok;
 		{error,{reload,_}} ->
 			ok
 	end.
+
+init_tls() ->
+	Sch = erlang:system_info(schedulers),
+	[(catch spawn_opt(fun() -> init_tls(N) end, [{scheduler, N}])) || N <- lists:seq(0,Sch)],
+	ok.
