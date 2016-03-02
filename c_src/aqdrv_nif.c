@@ -22,7 +22,6 @@
 // Every new write is aligned to this.
 #define WRITE_ALIGNMENT 1024
 #define PGSZ 4096
-#define HEADER_SPACE 10
 
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_false;
@@ -574,14 +573,13 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 
 	size = cmd->conn->data.writeSize + cmd->conn->map.writeSize + cmd->conn->headerSize;
 
-	if (size > 1024)
+	if (size > WRITE_ALIGNMENT)
 	{
-		// page alignment
-		if (size % 1024)
-			size += (1024 - (size % 1024));
+		if (size % WRITE_ALIGNMENT)
+			size += (WRITE_ALIGNMENT - (size % WRITE_ALIGNMENT));
 	}
 	else
-		size = 1024;
+		size = WRITE_ALIGNMENT;
 
 	INITTIME;
 	TIME start;

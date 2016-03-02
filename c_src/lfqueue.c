@@ -22,7 +22,7 @@ static void initq(intq *q)
 	atomic_store(&q->head, stub);
 	q->tail = stub;
 }
-
+// Actual queue push.
 static void qpush(intq* self, qitem* n)
 {
 	qitem* prev;
@@ -30,7 +30,7 @@ static void qpush(intq* self, qitem* n)
 	prev = atomic_exchange(&self->head, n);
 	atomic_store(&prev->next, n);
 }
-
+// Actual queue pop.
 static qitem* qpop(intq* self)
 {
 	qitem* tail = self->tail;
@@ -49,6 +49,12 @@ static qitem* qpop(intq* self)
 	return NULL;
 }
 
+// External API. For a task queue.
+// Actually uses multiple internal queues.
+// The main queue is X producers to 1 consumer.
+// Recycle queues are between every producer and consumer (1to1).
+// All based on initq/qpush/qpop. 
+// Fixed size and does no allocations after first calls.
 queue *queue_create()
 {
 	queue *ret;
@@ -68,7 +74,7 @@ void queue_destroy(queue *queue)
 	free(queue);
 }
 
-
+// Push item from scheduler thread to worker thread.
 int queue_push(queue *queue, qitem *entry)
 {
 	qpush(&queue->q, entry);
@@ -76,16 +82,19 @@ int queue_push(queue *queue, qitem *entry)
 	return 1;
 }
 
+// Not used. Will be once old queue will no longer be used.
 int queue_size(queue *queue)
 {
 	return 0;
 }
 
+// Return item if available, otherwise NULL.
 qitem* queue_trypop(queue *queue)
 {
 	return qpop(&queue->q);
 }
 
+// Get item or wait max time.
 qitem* queue_timepop(queue *queue, uint32_t miliseconds)
 {
 	qitem *r = qpop(&queue->q);
@@ -100,6 +109,8 @@ qitem* queue_timepop(queue *queue, uint32_t miliseconds)
 	}
 }
 
+// Called on worker thread to get an item. Will wait if no items are available.
+// Does busy wait for 2ms.
 qitem* queue_pop(queue *queue)
 {
 	qitem *r = qpop(&queue->q);
@@ -128,11 +139,13 @@ qitem* queue_pop(queue *queue)
 }
 
 // Push entry back to home queue.
+// Called from worker thread to give an entry back to a scheduler thread.
 void queue_recycle(queue *queue,qitem *entry)
 {
 	qpush(entry->home, entry);
 }
 
+// Called only once per thread.
 static void populate(intq *q)
 {
 	int i;
@@ -157,6 +170,8 @@ static void populate(intq *q)
 
 // scheduler thread is the single consumer of tls_reuseq
 // producers are worker threads or scheduler thread itself.
+// We have a fixed number of events that are populated on first call.
+// If return NULL, caller should busy wait, go do something else or sleep.
 qitem* queue_get_item(queue *queue)
 {
 	// qitem *res;

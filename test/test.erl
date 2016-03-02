@@ -1,6 +1,6 @@
 -module(test).
 -include_lib("eunit/include/eunit.hrl").
--define(CFG,#{wthreads => 1, startindex => {1}, paths => {"./"}, pwrite => 0}).
+-define(CFG,#{wthreads => 3, startindex => {1}, paths => {"./"}, pwrite => 0}).
 -define(INIT,aqdrv:init(?CFG)).
 
 run_test_() ->
