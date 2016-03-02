@@ -20,7 +20,7 @@
 #include "aqdrv_nif.h"
 
 // Every new write is aligned to this.
-#define WRITE_ALIGNMENT 1024
+#define WRITE_ALIGNMENT 512
 #define PGSZ 4096
 
 static ERL_NIF_TERM atom_ok;
@@ -224,7 +224,8 @@ static u32 add_bin(coninf *con, lz4buf *buf, ErlNifBinary bin, u32 offset)
 		bin.data + offset, toWrite, NULL);
 	if (LZ4F_isError(bWritten))
 	{
-		DBG("Can not write data ws=%u, offset=%u, toWrite=%u, bufsize=%u",buf->writeSize, offset, toWrite, buf->bufSize);
+		DBG("Can not write data ws=%u, offset=%u, toWrite=%u, bufsize=%u, error=%s",
+			buf->writeSize, offset, toWrite, buf->bufSize,LZ4F_getErrorName(bWritten));
 		return 0;
 	}
 
@@ -525,6 +526,15 @@ static void fail_send(int i, thrinf *thr)
 	enif_clear_env(thr->env);
 }
 
+static void reset_con(coninf *con)
+{
+	con->map.bufSize = con->data.bufSize = 0;
+	con->map.uncomprSz = con->data.uncomprSz = 0;
+	con->map.writeSize = con->data.writeSize = 0;
+	con->headerSize = con->replSize = 0;
+	con->started = 0;
+}
+
 static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 {
 	int rc = 0, i = 0;
@@ -549,7 +559,8 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 	lseek(data->curFile->fd, writePos, SEEK_SET);
 	rc = writev(data->curFile->fd, &iov[1], 3);
 #endif
-	DBG("WRITEV! %d",rc);
+	DBG("WRITEV! %d pos=%u",rc, writePos);
+	reset_con(con);
 
 	if (con->doReplicate)
 	{
@@ -568,7 +579,7 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 			#endif
 				if (rc != entireLen+4)
 				{
-					DBG("Invalid result when sending %d",rt);
+					DBG("Invalid result when sending %d",rc);
 					// close(thread->sockets[i]);
 					data->sockets[i] = 0;
 					fail_send(i,data);
@@ -576,12 +587,6 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 			}
 		}
 	}
-
-	con->map.bufSize = con->data.bufSize = 0;
-	con->map.uncomprSz = con->data.uncomprSz = 0;
-	con->map.writeSize = con->data.writeSize = 0;
-	con->headerSize = con->replSize = 0;
-	con->started = 0;
 
 	return rc;
 }
@@ -632,10 +637,6 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 	else
 		size = WRITE_ALIGNMENT;
 
-	INITTIME;
-	TIME start;
-	TIME stop;
-
 	while (1)
 	{
 		writePos = atomic_fetch_add(&curFile->reservePos, size);
@@ -664,10 +665,8 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 			DBG("Moving? curfile=%lld", curFile->logIndex);
 		}
 	}
-	GETTIME(start);
+
 	do_pwrite(data, cmd->conn, writePos);
-	GETTIME(stop);
-	NANODIFF(stop, start, (*diff));
 
 	// if (endPos % (1024*1024*10) == 0)
 	DBG("writePos=%llu, endPos=%llu, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
@@ -763,17 +762,19 @@ static void *wthread(void *arg)
 			if (cmd->type == cmd_write)
 			{
 				u32 resp;
-				
-				// TIME stop;
+				TIME stop;
+				TIME start;
 				u64 diff;
-				// GETTIME(start);
-				resp = reserve_write(data, item, &diff);
-				// GETTIME(stop);
-				// NANODIFF(stop, start, diff);
+				GETTIME(start);
+				resp = reserve_write(data, item, NULL);
+				GETTIME(stop);
+				NANODIFF(stop, start, diff);
 				// cmd->answer = enif_make_uint(item->env, resp);
+				
 				cmd->answer = enif_make_tuple2(item->env, 
 					enif_make_uint(item->env, resp),
 					enif_make_uint64(item->env, diff));
+
 				respond_cmd(data, item);
 				++wcount;
 			}

@@ -39,7 +39,6 @@ static qitem* qpop(intq* self)
 	{
 		self->tail = next;
 		tail->cmd = next->cmd;
-		tail->type = next->type;
 		tail->home = next->home;
 		#ifndef _TESTAPP_
 		tail->env = next->env;
@@ -127,7 +126,9 @@ qitem* queue_pop(queue *queue)
 			if (r)
 				return r;
 			if (diff > 2000000) // 2ms max busy wait
+			{
 				SEM_WAIT(queue->sem);
+			}
 		}
 	}
 }

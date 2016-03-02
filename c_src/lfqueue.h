@@ -13,7 +13,6 @@ typedef struct intq intq;
 struct qitem_t
 {
 	_Atomic (struct qitem_t*) next;
-	int type;
 	void *cmd;
 	#ifndef _TESTAPP_
 	ErlNifEnv *env;

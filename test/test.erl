@@ -5,6 +5,10 @@
 
 run_test_() ->
 	% [file:delete(Fn) || Fn <- ["1"]],
+	% Write random data over beginning
+	{ok,W} = file:open("1",[write,read,binary,raw]),
+	file:write(W,crypto:rand_bytes(400096)),
+	file:close(W),
 	[
 	fun dowrite/0,
 	% fun cleanup/0
@@ -60,41 +64,54 @@ async() ->
 	% +binary:decode_unsigned(crypto:rand_bytes(2)
 
 	% Every write is 4K minimum, so anything under 4K is irrelevant.
-	RandBytes = [crypto:rand_bytes(49) || _ <- lists:seq(1,1000)],
-	Pids = [element(1,spawn_monitor(fun() -> w(P,RandBytes) end)) || P <- lists:seq(1,100)],
+	RandBytes = [crypto:rand_bytes(390) || _ <- lists:seq(1,1000)],
+	Pids = [begin
+			ets:insert(ops,{P,0}),
+		element(1,spawn_monitor(fun() -> w(P,RandBytes) end)) 
+	end || P <- lists:seq(1,100)],
 	receive
 		{'DOWN',_Monitor,_,_PID,Reason} ->
 			exit(Reason)
 	after 20000 ->
 		ok
 	end,
-	[exit(P,stop) || P <- Pids],
-	timer:sleep(3000),
-	?debugFmt("Reads: ~p, Writes: ~p",[ets:lookup(ops,r),ets:lookup(ops,w)]).
+	[P ! stop || P <- Pids],
+	Ops = rec_counts(0),
+	?debugFmt("Ops: ~p",[Ops]).
+rec_counts(N) ->
+	receive
+		{'DOWN',_Monitor,_,_PID,Reason} ->
+			rec_counts(N+Reason)
+		after 2000 ->
+			N
+	end.
 
 w(N,RandList) ->
 	C = aqdrv:open(N),
-	w(C,1,RandList,[]).
-w(Con,Counter,[Rand|T],L) ->
+	w(N,C,1,RandList,[]).
+w(Me,Con,Counter,[Rand|T],L) ->
+	{_,QL} = erlang:process_info(self(),message_queue_len),
 	ok = aqdrv:stage_map(Con, <<"ITEM1">>, 1, byte_size(Rand)),
 	ok = aqdrv:stage_data(Con, Rand),
 	{_,_} = aqdrv:stage_flush(Con),
 	{WPos,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
 	case ok of
-		% _ when Time > 1000000 ->
-		% 	?debugFmt("Time1 ~pms, wpos=~pmb, ~p",[Time div 1000000, WPos div 1000000, Counter]);
+		_ when QL > 0 ->
+			exit(Counter+1);
+		_ when Time > 1000000 ->
+			?debugFmt("Time1 ~pms, wpos=~pmb, ~p",[Time div 1000000, WPos div 1000000, Counter]);
 		%  Pos rem (1024*1024*1) == 0;
-		_ when Counter rem 10000 == 0 ->
+		_ when Me == 1, Counter rem 1000 == 0 ->
 			?debugFmt("~pmb, ~p",[WPos div 1000000, Counter]),
 			% ?debugFmt("Offset=~p, diffCpy=~p, diffSetup=~p diffAll=~p",[Pos,Diff1,SetupDiff,Diff2]);
 			ok;
 		_ ->
 			ok
 	end,
-	ets:update_counter(ops,w,{2,1}),
-	w(Con,Counter+1,T,[Rand|L]);
-w(Con,Counter,[],L) ->
-	w(Con,Counter,L,[]).
+	% ets:update_counter(ops,Me,{2,1}),
+	w(Me,Con,Counter+1,T,[Rand|L]);
+w(Me,Con,Counter,[],L) ->
+	w(Me,Con,Counter,L,[]).
 
 	% ?debugFmt("Verifying",[]),
 	% {ok,Fd} = file:open("1",[raw,binary,read]),
