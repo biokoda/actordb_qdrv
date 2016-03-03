@@ -62,8 +62,7 @@ queue *queue_create()
 	if(ret == NULL) 
 		return NULL;
 
-	SEM_INIT(ret->sem);
-	if (ret->sem == NULL)
+	if (SEM_INIT(ret->sem))
 		return NULL;
 	initq(&ret->q);
 
