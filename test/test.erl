@@ -2,6 +2,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -define(CFG,#{wthreads => 3, startindex => {1}, paths => {"./"}, pwrite => 0}).
 -define(INIT,aqdrv:init(?CFG)).
+-define(LOAD_TEST_COMPR,false).
 
 run_test_() ->
 	% [file:delete(Fn) || Fn <- ["1"]],
@@ -19,7 +20,7 @@ run_test_() ->
 dowrite() ->
 	?INIT,
 	application:ensure_all_started(crypto),
-	C = aqdrv:open(1),
+	C = aqdrv:open(1,true),
 	Header = [<<"HEADER_PART1">>,<<"HEADER_PART2">>],
 	HeaderSz = iolist_size(Header),
 	Body = <<"DATA SECTION START",(crypto:rand_bytes(4096))/binary>>,
@@ -60,10 +61,7 @@ async() ->
 	ets:new(ops,[set,public,named_table,{write_concurrency,true}]),
 	ets:insert(ops,{w,0}),
 	ets:insert(ops,{r,0}),
-	% Random sized buffers
-	% +binary:decode_unsigned(crypto:rand_bytes(2)
 
-	% Every write is 4K minimum, so anything under 4K is irrelevant.
 	RandBytes = [crypto:rand_bytes(390) || _ <- lists:seq(1,1000)],
 	Pids = [begin
 			ets:insert(ops,{P,0}),
@@ -87,7 +85,7 @@ rec_counts(N) ->
 	end.
 
 w(N,RandList) ->
-	C = aqdrv:open(N),
+	C = aqdrv:open(N,?LOAD_TEST_COMPR),
 	w(N,C,1,RandList,[]).
 w(Me,Con,Counter,[Rand|T],L) ->
 	{_,QL} = erlang:process_info(self(),message_queue_len),

@@ -177,20 +177,23 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	u32 thread;
 	coninf *con;
+	u32 compr;
 	priv_data *pd = (priv_data*)enif_priv_data(env);
 
-	if (argc != 1)
+	if (argc != 2)
 		return make_error_tuple(env, "integer hash required");
 
 	if (!enif_get_uint(env, argv[0], &thread))
 		return make_error_tuple(env, "integer hash required");
+	if (!enif_get_uint(env, argv[1], &compr))
+		return make_error_tuple(env, "integer compr flag required");
 
 	con = enif_alloc_resource(connection_type, sizeof(coninf));
 	if (!con)
 		return atom_false;
 	memset(con,0,sizeof(coninf));
 	con->thread = thread % pd->nThreads;
-	con->doCompr = 0;
+	con->doCompr = compr;
 	if (con->doCompr)
 	{
 		con->data.buf = calloc(1,PGSZ);
@@ -878,7 +881,7 @@ static void *sthread(void *arg)
 		if (item != NULL)
 			cmd = (db_command*)item->cmd;
 
-		DBG("syncthr do=%d, curfile=%lld",cmd->type, curFile->logIndex);
+		DBG("syncthr curfile=%lld", curFile->logIndex);
 
 		if (cmd && cmd->conn)
 		{
@@ -920,14 +923,14 @@ static void *sthread(void *arg)
 				TIME stop;
 				u64 diff = 0;
 				GETTIME(start);
-				// #if defined(__APPLE__) || defined(_WIN32)
-				// 	fsync(curFile->fd);
-				// #elif defined(__linux__)
-				// 	sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
-				// 		SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
-				// #else
-				// 	fdatasync(curFile->fd);
-				// #endif
+				#if defined(__APPLE__) || defined(_WIN32)
+					fsync(curFile->fd);
+				#elif defined(__linux__)
+					sync_file_range(curFile->fd, syncFrom, highestPos - syncFrom, 
+						SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER);
+				#else
+					fdatasync(curFile->fd);
+				#endif
 
 				GETTIME(stop);
 				// NANODIFF(stop, start, diff);
@@ -1025,7 +1028,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	*priv_out = priv;
 	priv->nThreads = 1;
 	priv->nPaths = 1;
-	priv->doCompr = 1;
+	// priv->doCompr = 1;
 
 	atom_false = enif_make_atom(env,"false");
 	atom_ok = enif_make_atom(env,"ok");
@@ -1084,16 +1087,16 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			return -1;
 		}
 	}
-	if (enif_get_map_value(env, info, atom_compr, &value))
-	{
-		int compr = 1;
-		if (!enif_get_int(env, value, &compr))
-		{
-			DBG("Param not tuple");
-			return -1;
-		}
-		priv->doCompr = compr;
-	}
+	// if (enif_get_map_value(env, info, atom_compr, &value))
+	// {
+	// 	int compr = 1;
+	// 	if (!enif_get_int(env, value, &compr))
+	// 	{
+	// 		DBG("Param not tuple");
+	// 		return -1;
+	// 	}
+	// 	priv->doCompr = compr;
+	// }
 
 	// priv->lastPos = calloc(priv->nPaths*priv->nThreads, sizeof(atomic_ullong));
 	priv->tasks = calloc(priv->nPaths*priv->nThreads,sizeof(queue*));
@@ -1223,7 +1226,7 @@ static void on_unload(ErlNifEnv* env, void* pd)
 }
 
 static ErlNifFunc nif_funcs[] = {
-	{"open", 1, q_open},
+	{"open", 2, q_open},
 	{"stage_map", 4, q_stage_map},
 	{"stage_data", 3, q_stage_data},
 	{"stage_flush", 1, q_flush},

@@ -68,7 +68,7 @@ typedef struct priv_data
 #ifndef _TESTAPP_
 	ErlNifTid *wtids;
 	ErlNifTid *stids;
-	u8 doCompr;
+	// u8 doCompr;
 	ErlNifPid tunnelConnector;
 #endif
 	intq **schQueues;

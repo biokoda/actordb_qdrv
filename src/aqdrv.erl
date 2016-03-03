@@ -1,13 +1,18 @@
 -module(aqdrv).
--export([init/1, open/1, stage_map/4, stage_data/2, 
+-export([init/1, open/2, stage_map/4, stage_data/2, 
 	stage_flush/1, write/3, set_tunnel_connector/0, set_thread_fd/4,
 	replicate_opts/2, replicate_opts/3]).
 
 init(Info) when is_map(Info) ->
 	aqdrv_nif:init(Info).
 
-open(Hash) ->
-	aqdrv_nif:open(Hash).
+% integer hash of name for connection
+% should data be compressed or not. Compression requires copying data,
+% if data is already compact compression is a giant waste of resources.
+open(Hash,true) ->
+	aqdrv_nif:open(Hash,1);
+open(Hash,false) ->
+	aqdrv_nif:open(Hash,0).
 
 set_tunnel_connector() ->
 	aqdrv_nif:set_tunnel_connector().
