@@ -94,12 +94,13 @@ w(Me,Con,Counter,[Rand|T],L) ->
 	ok = aqdrv:stage_map(Con, <<"ITEM1">>, 1, byte_size(Rand)),
 	ok = aqdrv:stage_data(Con, Rand),
 	{_,_} = aqdrv:stage_flush(Con),
+	% WPos = Time = 0,
 	{WPos,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
 	case ok of
 		_ when QL > 0 ->
 			exit(Counter+1);
-		_ when Time > 1000000 ->
-			?debugFmt("Time1 ~pms, wpos=~pmb, ~p",[Time div 1000000, WPos div 1000000, Counter]);
+		% _ when Time > 1000000 ->
+		% 	?debugFmt("Time1 ~pms, wpos=~pmb, ~p",[Time div 1000000, WPos div 1000000, Counter]);
 		%  Pos rem (1024*1024*1) == 0;
 		_ when Me == 1, Counter rem 1000 == 0 ->
 			?debugFmt("~pmb, ~p",[WPos div 1000000, Counter]),

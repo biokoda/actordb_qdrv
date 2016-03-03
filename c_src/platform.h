@@ -32,11 +32,22 @@
 #define MS(X)  (1000000*X)
 #define US(X)  (1000*X)
 
+#if defined(_WIN32)
+	#define IOV WSABUF
+	#define IOV_SET(IOV, DATA, LEN) IOV.buf = DATA; IOV.len = LEN
+	#define IOV_SEND(RT, FD, IOV, IOVSIZE) WSASend(FD,IOV,IOVSIZE, &RT, 0, NULL, NULL)
+#else
+	#define IOV struct iovec
+	#define IOV_SET(IOV, DATA, LEN) IOV.iov_base = DATA; IOV.iov_len = LEN
+	#define IOV_SEND(RT, FD, IOV, IOVSIZE) RT = writev(FD,IOV,IOVSIZE)
+#endif
+
 #if defined(__APPLE__)
 	#include <mach/mach_time.h>
 	#include <libkern/OSAtomic.h>
 	#define MemoryBarrier OSMemoryBarrier
 	#include <dispatch/dispatch.h>
+	#define IOV struct iovec
 	#define SEMAPHORE dispatch_semaphore_t
 	#define TIME u64
 	#define SEM_INIT(X) X = dispatch_semaphore_create(0)

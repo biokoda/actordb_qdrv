@@ -91,6 +91,10 @@ typedef struct lz4buf
 {
 	LZ4F_compressionContext_t cctx;
 	u8 *buf;
+	// if we are not compressing we use iov
+	IOV *iov;
+	u32 iovSize;
+	u32 iovUsed;
 	u32 bufSize;
 	u32 uncomprSz;
 	u32 writeSize;
@@ -99,6 +103,7 @@ typedef struct lz4buf
 
 typedef struct coninf
 {
+	ErlNifEnv *env;
 	lz4buf data;
 	lz4buf map;
 	u8 *header;
@@ -110,6 +115,7 @@ typedef struct coninf
 	int thread;
 	u8 started;
 	u8 doReplicate;
+	u8 doCompr;
 	#ifndef _TESTAPP_
 	// Fixed part of packet prefix
 	char* packetPrefix;

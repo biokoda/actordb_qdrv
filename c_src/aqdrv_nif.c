@@ -22,6 +22,7 @@
 // Every new write is aligned to this.
 #define WRITE_ALIGNMENT 512
 #define PGSZ 4096
+#define IOV_START_AT 4
 
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_false;
@@ -67,10 +68,22 @@ static void destruct_connection(ErlNifEnv *env, void *arg)
 	DBG("Destruct conn");
 	LZ4F_freeCompressionContext(r->map.cctx);
 	LZ4F_freeCompressionContext(r->data.cctx);
+	enif_free_env(r->env);
 	free(r->map.buf);
 	free(r->data.buf);
 	free(r->packetPrefix);
 	free(r->header);
+}
+
+static void reset_con(coninf *con)
+{
+	con->data.iovUsed = IOV_START_AT;
+	con->map.bufSize = con->data.bufSize = 0;
+	con->map.uncomprSz = con->data.uncomprSz = 0;
+	con->map.writeSize = con->data.writeSize = 0;
+	con->headerSize = con->replSize = 0;
+	con->started = 0;
+	enif_clear_env(con->env);
 }
 
 static ERL_NIF_TERM make_error_tuple(ErlNifEnv *env, const char *reason)
@@ -163,7 +176,7 @@ static ERL_NIF_TERM q_set_thread_fd(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	u32 thread;
-	coninf *conn;
+	coninf *con;
 	priv_data *pd = (priv_data*)enif_priv_data(env);
 
 	if (argc != 1)
@@ -172,20 +185,54 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	if (!enif_get_uint(env, argv[0], &thread))
 		return make_error_tuple(env, "integer hash required");
 
-	conn = enif_alloc_resource(connection_type, sizeof(coninf));
-	if (!conn)
+	con = enif_alloc_resource(connection_type, sizeof(coninf));
+	if (!con)
 		return atom_false;
-	memset(conn,0,sizeof(coninf));
-	conn->thread = thread % pd->nThreads;
-	conn->data.buf = calloc(1,PGSZ);
-	conn->data.bufSize = PGSZ;
-	conn->map.bufSize = PGSZ;
-	conn->map.buf = calloc(1,PGSZ);
-	conn->header = calloc(1,HDRMAX);
-	LZ4F_createCompressionContext(&conn->data.cctx, LZ4F_VERSION);
-	LZ4F_createCompressionContext(&conn->map.cctx, LZ4F_VERSION);
+	memset(con,0,sizeof(coninf));
+	con->thread = thread % pd->nThreads;
+	con->doCompr = 0;
+	if (con->doCompr)
+	{
+		con->data.buf = calloc(1,PGSZ);
+		con->data.bufSize = PGSZ;
+	}
+	else
+	{
+		con->data.buf = calloc(1,8);
+		con->data.bufSize = 8;
+	}
+	con->data.iov = calloc(10,sizeof(IOV));
+	con->data.iovSize = 10;
+	con->data.iovUsed = IOV_START_AT;
+	con->map.bufSize = PGSZ;
+	con->map.buf = calloc(1,PGSZ);
+	con->header = calloc(1,HDRMAX);
+	con->env = enif_alloc_env();
+	LZ4F_createCompressionContext(&con->data.cctx, LZ4F_VERSION);
+	LZ4F_createCompressionContext(&con->map.cctx, LZ4F_VERSION);
 
-	return enif_make_tuple2(env, enif_make_atom(env,"aqdrv"), enif_make_resource(env, conn));
+	return enif_make_tuple2(env, enif_make_atom(env,"aqdrv"), enif_make_resource(env, con));
+}
+
+static u32 add_iov_bin(coninf *con, lz4buf *buf, ErlNifBinary bin)
+{
+	if (!con->started)
+	{
+		writeUint32LE(buf->buf, 0x184D2A50);
+		buf->writeSize = 8;
+	}
+	if (buf->iovSize == buf->iovUsed)
+	{
+		buf->iovSize *= 1.5;
+		buf->iov = realloc(buf->iov, buf->iovSize*sizeof(IOV));
+	}
+	IOV_SET(buf->iov[buf->iovUsed], bin.data, bin.size);
+	buf->iovUsed++;
+
+	buf->writeSize += bin.size;
+	buf->uncomprSz += bin.size;
+
+	return bin.size;
 }
 
 static u32 add_bin(coninf *con, lz4buf *buf, ErlNifBinary bin, u32 offset)
@@ -300,7 +347,7 @@ static ERL_NIF_TERM q_stage_data(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
 
 	if (!enif_get_resource(env, argv[0], connection_type, (void **) &res))
 		return enif_make_badarg(env);
-	if (!enif_inspect_binary(env, argv[1], &bin))
+	if (!enif_is_binary(env, argv[1]))
 		return make_error_tuple(env, "not binary");
 	if (!enif_get_uint(env, argv[2], &offset))
 		return make_error_tuple(env, "not uint");
@@ -308,9 +355,22 @@ static ERL_NIF_TERM q_stage_data(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
 	DBG("stage data");
 
 	enif_consume_timeslice(env,98);
-	offset = add_bin(res, &res->data, bin, offset);
-	if (!offset)
-		return atom_false;
+	if (!res->doCompr)
+	{
+		// Make a copy to our env. This will keep it in place while we need it.
+		ERL_NIF_TERM termcpy = enif_make_copy(res->env, argv[1]);
+		if (!enif_inspect_binary(res->env, termcpy, &bin))
+			return make_error_tuple(env, "not binary");
+		offset = add_iov_bin(res, &res->data, bin);
+	}
+	else
+	{
+		if (!enif_inspect_binary(res->env, argv[1], &bin))
+			return make_error_tuple(env, "not binary");
+		offset = add_bin(res, &res->data, bin, offset);
+		if (!offset)
+			return atom_false;
+	}
 	res->started = 1;
 	return enif_make_uint(env, offset);
 }
@@ -335,12 +395,19 @@ static ERL_NIF_TERM q_flush(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 		return atom_false;
 	con->map.writeSize += bWritten;
 
-	bWritten = LZ4F_compressEnd(con->data.cctx, 
-			con->data.buf + con->data.writeSize, 
-			con->data.bufSize - con->data.writeSize, NULL);
-	if (LZ4F_isError(bWritten))
-		return atom_false;
-	con->data.writeSize += bWritten;
+	if (con->doCompr)
+	{
+		bWritten = LZ4F_compressEnd(con->data.cctx, 
+				con->data.buf + con->data.writeSize, 
+				con->data.bufSize - con->data.writeSize, NULL);
+		if (LZ4F_isError(bWritten))
+			return atom_false;
+		con->data.writeSize += bWritten;
+	}
+	else
+	{
+		writeUint32LE(con->data.buf + 4, con->data.writeSize-8);
+	}
 
 	enif_consume_timeslice(env,95);
 	return enif_make_tuple2(env, 
@@ -526,41 +593,35 @@ static void fail_send(int i, thrinf *thr)
 	enif_clear_env(thr->env);
 }
 
-static void reset_con(coninf *con)
-{
-	con->map.bufSize = con->data.bufSize = 0;
-	con->map.uncomprSz = con->data.uncomprSz = 0;
-	con->map.writeSize = con->data.writeSize = 0;
-	con->headerSize = con->replSize = 0;
-	con->started = 0;
-}
-
 static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 {
 	int rc = 0, i = 0;
 	u8 bufSize[4];
-	struct iovec iov[4];
+	IOV *iov = con->data.iov;
 	u32 entireLen = con->replSize + con->headerSize + con->map.writeSize + con->data.writeSize;
 
 	writeUint32(bufSize, entireLen);
 
-	iov[0].iov_base = bufSize;
-	iov[0].iov_len = sizeof(bufSize);
-	iov[1].iov_base = con->header + con->replSize;
-	iov[1].iov_len = con->headerSize;
-	iov[2].iov_base = con->map.buf;
-	iov[2].iov_len = con->map.writeSize;
-	iov[3].iov_base = con->data.buf;
-	iov[3].iov_len = con->data.writeSize;
+	IOV_SET(iov[0],bufSize, sizeof(bufSize));
+	IOV_SET(iov[1],con->header + con->replSize, con->headerSize);
+	IOV_SET(iov[2],con->map.buf, con->map.writeSize);
+	if (con->doCompr)
+	{
+		IOV_SET(iov[3],con->data.buf, con->data.writeSize);
+	}
+	else
+	{
+		// when not compressing buf only contains the lz4 skippable frame header
+		IOV_SET(iov[3], con->data.buf, 8);
+	}
 
 #if defined(__linux__)
-	rc = pwritev(data->curFile->fd, &iov[1], 3, writePos);
+	rc = pwritev(data->curFile->fd, &iov[1], con->data.iovUsed - 1, writePos);
 #else
 	lseek(data->curFile->fd, writePos, SEEK_SET);
-	rc = writev(data->curFile->fd, &iov[1], 3);
+	rc = writev(data->curFile->fd, &iov[1], con->data.iovUsed -1);
 #endif
 	DBG("WRITEV! %d pos=%u",rc, writePos);
-	reset_con(con);
 
 	if (con->doReplicate)
 	{
@@ -572,9 +633,9 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 			if (data->sockets[i] > 3 && data->socket_types[i] == 1)
 			{
 			#ifndef _WIN32
-				rc = writev(data->sockets[i],iov, 4);
+				rc = writev(data->sockets[i],iov, con->data.iovUsed);
 			#else
-				if (WSASend(data->sockets[i],iov, 4, &rt, 0, NULL, NULL) != 0)
+				if (WSASend(data->sockets[i],iov, con->data.iovUsed, &rt, 0, NULL, NULL) != 0)
 					rc = 0;
 			#endif
 				if (rc != entireLen+4)
@@ -587,6 +648,7 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 			}
 		}
 	}
+	reset_con(con);
 
 	return rc;
 }
@@ -792,6 +854,7 @@ static void *wthread(void *arg)
 	}
 	DBG("wthread done");
 
+	enif_free_env(data->env);
 	queue_destroy(data->tasks);
 	free(data);
 	return NULL;
@@ -943,6 +1006,7 @@ static void *sthread(void *arg)
 			break;
 	}
 
+	enif_free_env(data->env);
 	queue_destroy(data->tasks);
 	free(data);
 	return NULL;

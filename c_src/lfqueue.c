@@ -63,6 +63,8 @@ queue *queue_create()
 		return NULL;
 
 	SEM_INIT(ret->sem);
+	if (ret->sem == NULL)
+		return NULL;
 	initq(&ret->q);
 
 	return ret;
@@ -70,6 +72,7 @@ queue *queue_create()
 
 void queue_destroy(queue *queue)
 {
+	SEM_DESTROY(queue->sem);
 	free(queue);
 }
 
@@ -192,6 +195,10 @@ void queue_intq_destroy(intq *q)
 		return;
 	while ((it = qpop(q)))
 	{
+		#ifndef _TESTAPP_
+		if (it->env)
+			enif_free_env(it->env);
+		#endif
 		if (it->blockStart)
 			free(it);
 	}
