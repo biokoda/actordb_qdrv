@@ -64,7 +64,7 @@
 	#include <time.h>
 	#define SEMAPHORE sem_t
 	#define TIME struct timespec
-	#define SEM_INIT(X) sem_init(&X, 0, 0) == 0
+	#define SEM_INIT(X) sem_init(&X, 0, 0) != 0
 	#define SEM_WAIT(X) sem_wait(&X)
 	int SEM_TIMEDWAIT(sem_t s, u32 time);
 	#define SEM_POST(X) sem_post(&X)
