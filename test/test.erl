@@ -56,7 +56,7 @@ dowrite() ->
 
 async() ->
 	?debugFmt("Running many async reads/writes for 20s",[]),
-	?INIT,
+	% ?INIT,
 	application:ensure_all_started(crypto),
 	ets:new(ops,[set,public,named_table,{write_concurrency,true}]),
 	ets:insert(ops,{w,0}),

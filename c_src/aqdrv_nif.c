@@ -661,7 +661,6 @@ static qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
 	char filename[128];
 	int i;
 	qfile *file = calloc(1, sizeof(qfile));
-	
 	sprintf(filename, "%s/%lld",priv->paths[pathIndex], (long long int)logIndex);
 	file->fd = open(filename, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP);
 	if (file->fd > 0)
