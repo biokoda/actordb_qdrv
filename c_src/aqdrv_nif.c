@@ -18,11 +18,18 @@
 
 #include <errno.h>
 #include "aqdrv_nif.h"
-
 // Every new write is aligned to this.
 #define WRITE_ALIGNMENT 512
 #define PGSZ 4096
 #define IOV_START_AT 4
+
+#ifdef _WIN32
+#define __thread __declspec( thread )
+#endif
+
+// static __thread art_tree eventIndex;
+static __thread int tls_schedIndex;
+static __thread qfile *lastSchedFile = NULL;
 
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_false;
@@ -523,6 +530,7 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	return push_command(res->thread, -1, pd, item);
 }
 
+
 static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	priv_data *pd = (priv_data*)enif_priv_data(env);
@@ -534,9 +542,81 @@ static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 	if (!enif_get_int(env, argv[0], &n))
 		return atom_false;
 
+	tls_schedIndex = n;
+
 	it = queue_get_item();
 	pd->schQueues[n] = it->home;
 	queue_recycle(it);
+
+	return atom_ok;
+}
+
+// Caled after replication done. 
+// Must be called after successful replication and before next write call on connection.
+// argv0 - connection
+// argv1 - list of event names
+static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	// priv_data *pd = (priv_data*)enif_priv_data(env);
+	u32 pos;
+	ERL_NIF_TERM tail, head;
+	ErlNifBinary name;
+	coninf *res = NULL;
+	qfile *file = NULL;
+
+	if (argc != 2)
+		return atom_false;
+
+	if (!enif_get_resource(env, argv[0], connection_type, (void **) &res))
+		return enif_make_badarg(env);
+
+	file = res->lastFile;
+	if (file != lastSchedFile)
+	{
+		if (lastSchedFile != NULL)
+			atomic_fetch_sub(&lastSchedFile->indexRefs, 1);
+		lastSchedFile = file;
+		atomic_fetch_add(&lastSchedFile->indexRefs, 1);
+	}
+	pos = res->lastWpos;
+	while (enif_get_list_cell(env, argv[1], &head,&tail))
+	{
+		int i;
+		indexitem *item;
+		art_tree *index = &file->indexes[tls_schedIndex];
+		if (!enif_inspect_binary(env, head, &name))
+			return atom_false;
+
+		item = art_search(index, name.data, name.size);
+		if (!item)
+		{
+			item = calloc(1, sizeof(indexitem));
+			item->nPos = 6;
+			item->positions = malloc(item->nPos * sizeof(u32));
+			if (!item->positions)
+				return atom_false;
+			memset(item->positions, (u32)~0, item->nPos * sizeof(u32));
+			art_insert(index, name.data, name.size, item);
+		}
+		else
+		{
+			if (item->positions[item->nPos-1] != (u32)~0)
+			{
+				item->nPos *= 1.5;
+				item->positions = realloc(item->positions, item->nPos * sizeof(u32));
+				if (!item->positions)
+					return atom_false;
+			}
+		}
+		for (i = 0; i < item->nPos; i++)
+		{
+			if (item->positions[i] == (u32)~0)
+			{
+				item->positions[i] = pos;
+				break;
+			}
+		}
+	}
 
 	return atom_ok;
 }
@@ -674,17 +754,18 @@ static qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
 		free(file);
 		return NULL;
 	}
+	file->indexes = calloc(priv->nSch, sizeof(art_tree));
 	file->getMtx = enif_mutex_create("getmtx");
 	file->logIndex = logIndex;
 	for (i = 0; i < priv->nThreads; i++)
 		atomic_init(&file->thrPositions[i],0);
 	atomic_init(&file->reservePos, 0);
-	atomic_init(&file->refc, 0);
+	atomic_init(&file->writeRefs, 0);
 	priv->headFile[pathIndex] = file;
 	return file;
 }
 
-static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
+static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
 {
 	qfile *curFile = data->curFile;
 	u64 writePos = FILE_LIMIT;
@@ -700,6 +781,7 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 	}
 	else
 		size = WRITE_ALIGNMENT;
+	*pSzOut = size;
 
 	while (1)
 	{
@@ -721,9 +803,9 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 					// printf("Opened new file! %lld\n",nf->logIndex);
 					curFile->next = nf;
 				}
-				atomic_fetch_sub(&curFile->refc, 1);
+				atomic_fetch_sub(&curFile->writeRefs, 1);
 				data->curFile = curFile = curFile->next;
-				atomic_fetch_add(&curFile->refc, 1);
+				atomic_fetch_add(&curFile->writeRefs, 1);
 			}
 			enif_mutex_unlock(curFile->getMtx);
 			DBG("Moving? curfile=%lld", curFile->logIndex);
@@ -736,7 +818,7 @@ static u32 reserve_write(thrinf *data, qitem *item, u64 *diff)
 	DBG("writePos=%llu, endPos=%llu, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
 
 	cmd->conn->lastFile = curFile;
-	cmd->conn->lastWpos = writePos+size;
+	cmd->conn->lastWpos = writePos;
 	atomic_store(&curFile->thrPositions[data->windex], writePos+size);
 
 	return writePos;
@@ -825,18 +907,20 @@ static void *wthread(void *arg)
 			cmd = (db_command*)item->cmd;
 			if (cmd->type == cmd_write)
 			{
-				u32 resp;
+				u32 writePos, szOut;
 				TIME stop;
 				TIME start;
 				u64 diff;
 				GETTIME(start);
-				resp = reserve_write(data, item, NULL);
+				writePos = reserve_write(data, item, &szOut, NULL);
 				GETTIME(stop);
 				NANODIFF(stop, start, diff);
 				// cmd->answer = enif_make_uint(item->env, resp);
 				
-				cmd->answer = enif_make_tuple2(item->env, 
-					enif_make_uint(item->env, resp),
+				cmd->answer = enif_make_tuple3(item->env, 
+					enif_make_uint(item->env, writePos),
+					enif_make_uint(item->env, szOut),
+					// enif_make_uint64(item->env, cmd->conn->lastFile->logIndex),
 					enif_make_uint64(item->env, diff));
 
 				respond_cmd(data, item);
@@ -885,7 +969,7 @@ static void *sthread(void *arg)
 		if (cmd && cmd->conn)
 		{
 			cmd->answer = atom_ok;
-			if (cmd->conn->lastWpos <= cmd->conn->lastFile->syncPositions[cmd->conn->thread])
+			if (cmd->conn->lastWpos < cmd->conn->lastFile->syncPositions[cmd->conn->thread])
 			{
 				respond_cmd(data, item);
 				continue;
@@ -897,7 +981,7 @@ static void *sthread(void *arg)
 		while (1)
 		{
 			u32 highestPos = 0, syncFrom = ~0;
-			char curRefc = atomic_load_explicit(&curFile->refc,memory_order_relaxed);
+			char curRefc = atomic_load_explicit(&curFile->writeRefs,memory_order_relaxed);
 			u32 curReservePos = atomic_load_explicit(&curFile->reservePos,memory_order_relaxed);
 			threadsSeen += curRefc;
 
@@ -1145,7 +1229,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			inf->pd = priv;
 			inf->curFile = priv->tailFile[i];
 			inf->env = enif_alloc_env();
-			atomic_fetch_add(&inf->curFile->refc, 1);
+			atomic_fetch_add(&inf->curFile->writeRefs, 1);
 
 			if (enif_thread_create("wthr", &(priv->wtids[index]), wthread, inf, NULL) != 0)
 			{
@@ -1234,6 +1318,7 @@ static ErlNifFunc nif_funcs[] = {
 	{"set_thread_fd",4,q_set_thread_fd},
 	{"replicate_opts",3,q_replicate_opts},
 	{"init_tls",1,q_init_tls},
+	{"index_events",2,q_index_events},
 };
 
 ERL_NIF_INIT(aqdrv_nif, nif_funcs, on_load, NULL, NULL, on_unload);

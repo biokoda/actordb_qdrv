@@ -13,6 +13,7 @@
 #endif
 
 #include "lfqueue.h"
+#include "art.h"
 
 #define FILE_LIMIT 1024*1024*1024UL
 #define HDRMAX 512
@@ -34,14 +35,24 @@ extern FILE *g_log;
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 
-
+typedef struct indexitem
+{
+	u32 nPos;
+	u32 *positions;
+	// TODO:
+	// u32 nCons;
+	// cons *consumers;
+}indexitem;
 
 typedef struct qfile
 {
 	ErlNifMutex *getMtx;
 	u8 *wmap;
 	atomic_ulong reservePos;
-	atomic_char refc;
+	// reference count how many write threads are still referencing it
+	atomic_char writeRefs;
+	// reference count how many scheduler threads are still referencing it (for index).
+	atomic_char indexRefs;
 	// for every write thread what was last full byte. 
 	// Written to on write threads, read by sync thread.
 	atomic_uint thrPositions[MAX_WTHREADS];
@@ -49,6 +60,8 @@ typedef struct qfile
 	// and what requires syncing. It is a copy of thrPositions
 	// at the time of last sync.
 	u32 syncPositions[MAX_WTHREADS];
+	// Index for every scheduler.
+	art_tree *indexes;
 	i64 logIndex;
 	int fd;
 
@@ -68,7 +81,6 @@ typedef struct priv_data
 #ifndef _TESTAPP_
 	ErlNifTid *wtids;
 	ErlNifTid *stids;
-	// u8 doCompr;
 	ErlNifPid tunnelConnector;
 #endif
 	intq **schQueues;

@@ -1,7 +1,7 @@
 -module(aqdrv).
 -export([init/1, open/2, stage_map/4, stage_data/2, 
 	stage_flush/1, write/3, set_tunnel_connector/0, set_thread_fd/4,
-	replicate_opts/2, replicate_opts/3]).
+	replicate_opts/2, replicate_opts/3, index_events/2]).
 
 init(Info) when is_map(Info) ->
 	aqdrv_nif:init(Info).
@@ -14,6 +14,7 @@ open(Hash,true) ->
 open(Hash,false) ->
 	aqdrv_nif:open(Hash,0).
 
+% Replication socket.
 set_tunnel_connector() ->
 	aqdrv_nif:set_tunnel_connector().
 set_thread_fd(Thread,Fd,Pos,Type) ->
@@ -26,10 +27,15 @@ set_thread_fd(Thread,Fd,Pos,Type) ->
 			Res
 	end.
 
+% Replication data.
 replicate_opts(Con,PacketPrefix) ->
 	replicate_opts(Con,PacketPrefix,1).
 replicate_opts({actordb_driver, _Ref, Connection},PacketPrefix,Type) ->
 	ok = aqdrv_nif:replicate_opts(Connection,PacketPrefix,Type).
+
+% After replication done, add event names to index.
+index_events(Pos,[_|_] = Names) when is_integer(Pos) ->
+	ok = aqdrv_nif:index_events(Pos, Names).
 
 % Must be called before stage_data.
 % Sets name of event (binary), type (unsigned char) and size of data.
@@ -41,7 +47,8 @@ stage_data({aqdrv,Con}, <<_/binary>> = Bin) when byte_size(Bin) < 1024*1024*1024
 	stage_write1(Con,0, Bin).
 % Stage will write at most 256KB at once. This way we do not block scheduler for too long.
 % Data is not written to disk with this call.
-% stage_write compresses it to a buffer attached to the connection.
+% stage_write compresses it to a buffer attached to the connection. 
+% If compression not set it just remembers the binary and does no copying (unless small).
 stage_write1(Con,Offset,Bin) when byte_size(Bin) > Offset ->
 	NWritten = aqdrv_nif:stage_data(Con, Bin, Offset),
 	stage_write1(Con, Offset + NWritten, Bin);
