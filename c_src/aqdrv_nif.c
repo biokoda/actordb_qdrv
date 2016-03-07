@@ -28,7 +28,7 @@
 #endif
 
 // static __thread art_tree eventIndex;
-static __thread int tls_schedIndex;
+static __thread int tls_schedIndex = 0;
 static __thread qfile *lastSchedFile = NULL;
 
 static ERL_NIF_TERM atom_ok;

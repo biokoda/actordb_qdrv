@@ -14,6 +14,7 @@
 
 #include "lfqueue.h"
 #include "art.h"
+#include "lmdb.h"
 
 #define FILE_LIMIT 1024*1024*1024UL
 #define HDRMAX 512
