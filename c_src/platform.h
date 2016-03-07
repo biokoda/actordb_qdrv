@@ -76,4 +76,7 @@
 	 ((START.tv_sec * 1000000000UL) + START.tv_nsec)
 #endif
 
+void writeUint32LE(u8 *p, u32 v);
+void writeUint32(u8 *p, u32 v);
+
 #endif

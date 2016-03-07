@@ -93,7 +93,7 @@ w(Me,Con,Counter,[Rand|T],L) ->
 	ok = aqdrv:stage_data(Con, Rand),
 	{_,_} = aqdrv:stage_flush(Con),
 	% WPos = Time = 0,
-	{WPos,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
+	{WPos,Size,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
 	case ok of
 		_ when QL > 0 ->
 			exit(Counter+1);

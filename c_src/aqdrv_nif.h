@@ -1,26 +1,48 @@
 #ifndef _AQDRV_NIF_H
 #define _AQDRV_NIF_H
 
+#define _GNU_SOURCE
 #include "platform.h"
 #include "lz4frame.h"
 #include "lz4.h"
+#include "lfqueue.h"
+#include "art.h"
+#include "lmdb.h"
+
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <errno.h>
 #ifndef NOERL
 #include "erl_nif.h"
 #endif
+#ifndef  _WIN32
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/uio.h>
+#include <netinet/tcp.h>
+#include <sys/types.h>
+#include <netdb.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 
-#include "lfqueue.h"
-#include "art.h"
-#include "lmdb.h"
 
 #define FILE_LIMIT 1024*1024*1024UL
 #define HDRMAX 512
 #define MAX_WRITES 1024
 #define MAX_WTHREADS 6
 #define MAX_CONNECTIONS 8
+#define IOV_START_AT 4
+// Every new write is aligned to this.
+#define WRITE_ALIGNMENT 512
+#define PGSZ 4096
 
 extern FILE *g_log;
 #if defined(_TESTDBG_)
@@ -35,6 +57,20 @@ extern FILE *g_log;
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+
+extern ERL_NIF_TERM atom_ok;
+extern ERL_NIF_TERM atom_false;
+extern ERL_NIF_TERM atom_error;
+extern ERL_NIF_TERM atom_logname;
+extern ERL_NIF_TERM atom_wthreads;
+extern ERL_NIF_TERM atom_startindex;
+extern ERL_NIF_TERM atom_paths;
+extern ERL_NIF_TERM atom_compr;
+extern ERL_NIF_TERM atom_tcpfail;
+extern ERL_NIF_TERM atom_drivername;
+extern ERL_NIF_TERM atom_again;
+extern ERL_NIF_TERM atom_schedulers;
+extern ErlNifResourceType *connection_type;
 
 typedef struct indexitem
 {
@@ -161,5 +197,8 @@ typedef struct db_command
 #endif
 } db_command;
 
+qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv);
+void *wthread(void *arg);
+void *sthread(void *arg);
 
 #endif
