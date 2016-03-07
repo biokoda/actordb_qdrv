@@ -30,12 +30,12 @@ set_thread_fd(Thread,Fd,Pos,Type) ->
 % Replication data.
 replicate_opts(Con,PacketPrefix) ->
 	replicate_opts(Con,PacketPrefix,1).
-replicate_opts({actordb_driver, _Ref, Connection},PacketPrefix,Type) ->
+replicate_opts({aqdrv, Connection},PacketPrefix,Type) ->
 	ok = aqdrv_nif:replicate_opts(Connection,PacketPrefix,Type).
 
 % After replication done, add event names to index.
-index_events(Pos,[_|_] = Names) when is_integer(Pos) ->
-	ok = aqdrv_nif:index_events(Pos, Names).
+index_events({aqdrv,Con},[_|_] = Names) ->
+	ok = aqdrv_nif:index_events(Con, Names).
 
 % Must be called before stage_data.
 % Sets name of event (binary), type (unsigned char) and size of data.
