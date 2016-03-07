@@ -81,10 +81,18 @@ typedef struct indexitem
 	// cons *consumers;
 }indexitem;
 
+typedef struct mdbinf
+{
+	MDB_env *env;
+	MDB_txn *txn;
+	MDB_dbi db;
+}mdbinf;
+
 typedef struct qfile
 {
 	ErlNifMutex *getMtx;
 	u8 *wmap;
+	mdbinf *mdb;
 	atomic_ulong reservePos;
 	// reference count how many write threads are still referencing it
 	atomic_char writeRefs;

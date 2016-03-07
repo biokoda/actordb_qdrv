@@ -297,11 +297,80 @@ void *wthread(void *arg)
 	return NULL;
 }
 
+static int open_env(mdbinf *lm, const char *pth, int flags)
+{
+	int rc;
+
+	if ((rc = mdb_env_create(&lm->env)) != MDB_SUCCESS)
+		return rc;
+	if (mdb_env_set_mapsize(lm->env,1024*1024*128) != MDB_SUCCESS)
+		return rc;
+	if ((rc = mdb_env_open(lm->env, pth, MDB_NOSUBDIR | flags, 0664)) != MDB_SUCCESS)
+		return rc;
+	if ((rc = mdb_txn_begin(lm->env, NULL, flags, &lm->txn)) != MDB_SUCCESS)
+		return rc;
+	if ((rc = mdb_dbi_open(lm->txn, NULL, 0, &lm->db)) != MDB_SUCCESS)
+		return rc;
+
+	return 0;
+}
+
+static int index_to_lmdb(void *data, const unsigned char *key, uint32_t key_len, void *value)
+{
+	mdbinf *m = (mdbinf*)data;
+	indexitem *it = (indexitem*)value;
+	int i;
+	MDB_val k, v;
+	for (i = 0; i < it->nPos; i++)
+	{
+		if (it->positions[i] == (u32)~0)
+			break;
+	}
+	k.mv_size = key_len;
+	k.mv_data = (void*)key;
+	v.mv_size = i*sizeof(u32);
+	v.mv_data = it->positions;
+	if ((i = mdb_put(m->txn, m->db, &k, &v, MDB_NOOVERWRITE)) == MDB_SUCCESS)
+		return 0;
+	else
+		return i;
+}
+
+static void create_index(int pathIndex, qfile *curFile, priv_data *pd)
+{
+	int i;
+	mdbinf *m = calloc(1, sizeof(mdbinf));
+	char name[256];
+
+	sprintf(name, "%s/%lld.index", pd->paths[pathIndex], curFile->logIndex);
+	open_env(m, name, 0);
+	for (i = 0; i < pd->nSch; i++)
+	{
+		art_tree *index = &curFile->indexes[i];
+		if (index->root)
+		{
+			if (art_iter(index, index_to_lmdb, &m) != 0)
+			{
+				// ERROR
+				return;
+			}
+		}
+	}
+	mdb_txn_commit(m->txn);
+	mdb_env_close(m->env);
+
+	memset(m, 0, sizeof(mdbinf));
+	open_env(m, name, MDB_RDONLY);
+	MemoryBarrier();
+	curFile->mdb = m;
+}
+
+#define S_MAX_WAIT 100
 void *sthread(void *arg)
 {
 	thrinf* data = (thrinf*)arg;
 	const int nThreads = data->pd->nThreads;
-	int twait = 100;
+	int twait = S_MAX_WAIT;
 	INITTIME;
 
 	while (1)
@@ -311,7 +380,7 @@ void *sthread(void *arg)
 		qfile *curFile = data->curFile;
 		db_command *cmd = NULL;
 		qitem *itemsWaiting = NULL;
-		qitem *item = queue_timepop(data->tasks,MIN(twait,100));
+		qitem *item = queue_timepop(data->tasks,MIN(twait,50));
 		if (item != NULL)
 			cmd = (db_command*)item->cmd;
 
@@ -327,11 +396,12 @@ void *sthread(void *arg)
 			}
 		}
 
-		// When creating a new file, we may have a late write on the old file as well.
+		// When moving to a new file, we may have a late write on the old file as well.
 		// So we must check both files if they need syncing.
 		while (1)
 		{
 			u32 highestPos = 0, syncFrom = ~0;
+			char indexRefs = atomic_load_explicit(&curFile->indexRefs,memory_order_relaxed);
 			char curRefc = atomic_load_explicit(&curFile->writeRefs,memory_order_relaxed);
 			u32 curReservePos = atomic_load_explicit(&curFile->reservePos,memory_order_relaxed);
 			threadsSeen += curRefc;
@@ -378,19 +448,23 @@ void *sthread(void *arg)
 				// 	highestPos,
 				// 	curFile->logIndex);
 
-				if (diff > 100)
+				if (diff > S_MAX_WAIT)
 					twait = 0;
 				else
-					twait = 100-diff;
+					twait = S_MAX_WAIT-diff;
 			}
 			else
-				twait = 100;
+				twait = S_MAX_WAIT;
 
 			// If refc==0 we can safely move forward.
 			if (curRefc == 0 && curReservePos > 0 && curFile->next != NULL)
 			{
 				DBG("Moving to next file");
-				data->curFile = curFile = curFile->next;
+				if (!indexRefs)
+				{
+					create_index(data->pathIndex, curFile,data->pd);
+					data->curFile = curFile = curFile->next;
+				}
 			}
 			else if (threadsSeen >= nThreads)
 			{
