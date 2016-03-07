@@ -331,7 +331,10 @@ static int index_to_lmdb(void *data, const unsigned char *key, uint32_t key_len,
 	v.mv_size = i*sizeof(u32);
 	v.mv_data = it->positions;
 	if ((i = mdb_put(m->txn, m->db, &k, &v, MDB_NOOVERWRITE)) == MDB_SUCCESS)
+	{
+		DBG("LMDB PUT FAILED %d",i);
 		return 0;
+	}
 	else
 		return i;
 }
@@ -351,18 +354,29 @@ static void create_index(int pathIndex, qfile *curFile, priv_data *pd)
 		{
 			if (art_iter(index, index_to_lmdb, &m) != 0)
 			{
-				// ERROR
+				mdb_txn_abort(m->txn);
+				mdb_env_close(m->env);
+				unlink(name);
+				free(m);
 				return;
 			}
 		}
 	}
-	mdb_txn_commit(m->txn);
+	if (mdb_txn_commit(m->txn) != MDB_SUCCESS)
+	{
+		mdb_txn_abort(m->txn);
+		mdb_env_close(m->env);
+		unlink(name);
+		free(m);
+		return;
+	}
 	mdb_env_close(m->env);
 
 	memset(m, 0, sizeof(mdbinf));
-	open_env(m, name, MDB_RDONLY);
-	MemoryBarrier();
-	curFile->mdb = m;
+	if (open_env(m, name, MDB_RDONLY) == 0)
+	{
+		curFile->mdb = m;
+	}
 }
 
 #define S_MAX_WAIT 100
