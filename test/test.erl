@@ -63,7 +63,7 @@ async() ->
 	ets:insert(ops,{w,0}),
 	ets:insert(ops,{r,0}),
 
-	RandBytes = [{list_to_binary(integer_to_list(N)),crypto:rand_bytes(3900)} || N <- lists:seq(1,1000)],
+	RandBytes = [{list_to_binary(integer_to_list(N)),crypto:rand_bytes(1024)} || N <- lists:seq(1,1000)],
 	Pids = [begin
 			ets:insert(ops,{P,0}),
 			Sch = 1+ (P rem erlang:system_info(schedulers)),
@@ -72,7 +72,7 @@ async() ->
 	receive
 		{'DOWN',_Monitor,_,_PID,Reason} ->
 			exit(Reason)
-	after 30000 ->
+	after 20000 ->
 		ok
 	end,
 	[P ! stop || P <- Pids],

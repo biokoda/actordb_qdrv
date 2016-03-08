@@ -258,16 +258,16 @@ void *wthread(void *arg)
 
 	while (1)
 	{
-		qitem *item = queue_timepop(data->tasks,50);
-
-		if (item == NULL)
-		{
-			qfile *curFile = data->curFile;
-			u32 writePos = atomic_load(&curFile->reservePos);
-			if (writePos >= FILE_LIMIT)
-				move_forward(data);
-			continue;
-		}
+		// qitem *item = queue_timepop(data->tasks,50);
+		// if (item == NULL)
+		// {
+		// 	qfile *curFile = data->curFile;
+		// 	u32 writePos = atomic_load(&curFile->reservePos);
+		// 	if (writePos >= FILE_LIMIT)
+		// 		move_forward(data);
+		// 	continue;
+		// }
+		qitem *item = queue_pop(data->tasks);
 
 		// printf("wthr=%d  curfile=%lld\r\n",data->windex, data->curFile->logIndex);
 		// while (item)
