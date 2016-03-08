@@ -143,8 +143,9 @@ static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
 	u64 writePos = FILE_LIMIT;
 	u32 size;
 	db_command *cmd = (db_command*)item->cmd;
+	coninf *con = cmd->conn;
 
-	size = cmd->conn->data.writeSize + cmd->conn->map.writeSize + cmd->conn->headerSize;
+	size = con->data.writeSize + con->map.writeSize + con->headerSize;
 
 	if (size > WRITE_ALIGNMENT)
 	{
@@ -172,13 +173,25 @@ static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
 		}
 	}
 
-	do_pwrite(data, cmd->conn, writePos);
+	do_pwrite(data, con, writePos);
 
 	// if (endPos % (1024*1024*10) == 0)
 	DBG("writePos=%llu, endPos=%llu, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
 
-	cmd->conn->lastFile = curFile;
-	cmd->conn->lastWpos = writePos;
+	if (con->lastFile != curFile && con->fileRefc > 0)
+	{
+		atomic_fetch_sub(&con->lastFile->conRefs, 1);
+		con->fileRefc = 0;
+	}
+	con->lastFile = curFile;
+	con->lastWpos = writePos;
+	// If we are still holding ref to this file keep it.
+	// If we are not holding ref take it.
+	if (!con->fileRefc)
+	{
+		atomic_fetch_add(&con->lastFile->conRefs, 1);
+	}
+	con->fileRefc = 1;
 	atomic_store(&curFile->thrPositions[data->windex], writePos+size);
 
 	return writePos;
@@ -268,8 +281,6 @@ void *wthread(void *arg)
 		// 	continue;
 		// }
 		qitem *item = queue_pop(data->tasks);
-
-		// printf("wthr=%d  curfile=%lld\r\n",data->windex, data->curFile->logIndex);
 		// while (item)
 		{
 			db_command *cmd = (db_command*)item->cmd;
@@ -352,6 +363,7 @@ static int index_to_lmdb(void *data, const unsigned char *key, uint32_t key_len,
 	v.mv_data = it->positions;
 	if ((i = mdb_put(m->txn, m->db, &k, &v, MDB_NOOVERWRITE)) != MDB_SUCCESS)
 	{
+		// It seems art_iter can visit key twice...
 		if (i == MDB_KEYEXIST)
 			return 0;
 		// printf("LMDB PUT FAILED %d , %.*s\r\n",i, (int)k.mv_size, k.mv_data);
@@ -363,6 +375,12 @@ static int index_to_lmdb(void *data, const unsigned char *key, uint32_t key_len,
 		// printf("add: %.*s %lld \r\n", (int)k.mv_size, k.mv_data, it);
 		return 0;
 	}
+}
+
+static int cleanup_index(void *data, const unsigned char *key, uint32_t key_len, void *value)
+{
+	free(value);
+	return 0;
 }
 
 static void create_index(int pathIndex, qfile *curFile, priv_data *pd)
@@ -410,6 +428,14 @@ static void create_index(int pathIndex, qfile *curFile, priv_data *pd)
 	{
 		curFile->mdb = m;
 	}
+
+	for (i = 0; i < pd->nSch; i++)
+	{
+		art_tree *index = &curFile->indexes[i];
+		art_iter(index, cleanup_index, NULL);
+		art_tree_destroy(index);
+		curFile->indexes[i].root = NULL;
+	}
 }
 
 #define S_MAX_WAIT 100
@@ -448,7 +474,7 @@ void *sthread(void *arg)
 		while (1)
 		{
 			u32 highestPos = 0, syncFrom = ~0;
-			char indexRefs = atomic_load_explicit(&curFile->indexRefs,memory_order_relaxed);
+			long conRefs = atomic_load_explicit(&curFile->conRefs,memory_order_relaxed);
 			char curRefc = atomic_load_explicit(&curFile->writeRefs,memory_order_relaxed);
 			u32 curReservePos = atomic_load_explicit(&curFile->reservePos,memory_order_relaxed);
 			threadsSeen += curRefc;
@@ -503,13 +529,15 @@ void *sthread(void *arg)
 			else
 				twait = S_MAX_WAIT;
 
+			// printf("conrefs=%ld, curRefc=%d, posnow=%lld\r\n",
+			// 	conRefs, (int)curRefc, curFile->logIndex);
 			// If refc==0 we can safely move forward.
 			if (curRefc == 0 && curReservePos > 0 && curFile->next != NULL)
 			{
-				// printf("Moving to next file indexrefs=%d, posnow=%lld\r\n",(int)indexRefs, curFile->logIndex);
-				if (!indexRefs)
+				// printf("Moving to next file conrefs=%ld, posnow=%lld\r\n",conRefs, curFile->logIndex);
+				if (!conRefs)
 				{
-					create_index(data->pathIndex, curFile,data->pd);
+					create_index(data->pathIndex, curFile, data->pd);
 					data->curFile = curFile = curFile->next;
 				}
 			}

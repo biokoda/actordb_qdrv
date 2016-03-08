@@ -5,9 +5,8 @@
 #define __thread __declspec( thread )
 #endif
 
-// static __thread art_tree eventIndex;
 static __thread int tls_schedIndex = 0;
-static __thread qfile *lastSchedFile = NULL;
+// static __thread qfile *lastSchedFile = NULL;
 
 ERL_NIF_TERM atom_ok;
 ERL_NIF_TERM atom_false;
@@ -35,6 +34,8 @@ static const LZ4F_preferences_t lz4Prefs = {
 static void destruct_connection(ErlNifEnv *env, void *arg)
 {
 	coninf *r = (coninf*)arg;
+	if (r->lastFile && r->fileRefc)
+		atomic_fetch_sub(&r->lastFile->conRefs, 1);
 	DBG("Destruct conn");
 	LZ4F_freeCompressionContext(r->map.cctx);
 	LZ4F_freeCompressionContext(r->data.cctx);
@@ -81,7 +82,6 @@ static ERL_NIF_TERM push_command(int thread, int syncThread, priv_data *pd, qite
 		thrCmds = pd->tasks[thread];
 	else
 		thrCmds = pd->syncTasks[syncThread];
-	// printf("PUSH %d\r\n",thread);
 	if(!queue_push(thrCmds, item))
 	{
 		return make_error_tuple(item->env, "command_push_failed");
@@ -494,7 +494,8 @@ static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 	if (!enif_get_int(env, argv[0], &n))
 		return atom_false;
 
-	tls_schedIndex = n-1;
+	n--;
+	tls_schedIndex = n;
 
 	it = queue_get_item();
 	pd->schQueues[n] = it->home;
@@ -525,13 +526,15 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 	file = res->lastFile;
 	if (!file)
 		return atom_false;
-	if (file != lastSchedFile)
-	{
-		if (lastSchedFile != NULL)
-			atomic_fetch_sub(&lastSchedFile->indexRefs, 1);
-		lastSchedFile = file;
-		atomic_fetch_add(&lastSchedFile->indexRefs, 1);
-	}
+	if (!res->fileRefc)
+		return atom_false;
+	// if (file != lastSchedFile)
+	// {
+	// 	if (lastSchedFile != NULL)
+	// 		atomic_fetch_sub(&lastSchedFile->indexRefs, 1);
+	// 	lastSchedFile = file;
+	// 	atomic_fetch_add(&lastSchedFile->indexRefs, 1);
+	// }
 	pos = res->lastWpos;
 	tail = argv[1];
 	while (enif_get_list_cell(env, tail, &head, &tail))
@@ -576,6 +579,9 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 			}
 		}
 	}
+	// Remove reference for connection to file.
+	atomic_fetch_sub(&file->conRefs, 1);
+	res->fileRefc = 0;
 
 	return atom_ok;
 }

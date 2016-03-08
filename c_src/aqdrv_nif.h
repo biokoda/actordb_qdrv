@@ -96,8 +96,10 @@ typedef struct qfile
 	atomic_ulong reservePos;
 	// reference count how many write threads are still referencing it
 	atomic_char writeRefs;
-	// reference count how many scheduler threads are still referencing it (for index).
-	atomic_char indexRefs;
+	// reference count how many connections are between write and index_events for file.
+	// This means how many connections are still replicating a write to this file.
+	// Once it and writeRefs is 0, we can create a file index (mdb).
+	atomic_long conRefs;
 	// for every write thread what was last full byte. 
 	// Written to on write threads, read by sync thread.
 	atomic_uint thrPositions[MAX_WTHREADS];
@@ -174,6 +176,7 @@ typedef struct coninf
 	u8 started;
 	u8 doReplicate;
 	u8 doCompr;
+	u8 fileRefc;
 	#ifndef _TESTAPP_
 	// Fixed part of packet prefix
 	char* packetPrefix;
