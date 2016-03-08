@@ -77,12 +77,11 @@ static qitem* command_create(int thread, int syncThread, priv_data *p)
 static ERL_NIF_TERM push_command(int thread, int syncThread, priv_data *pd, qitem *item)
 {
 	queue *thrCmds = NULL;
-
 	if (syncThread == -1)
 		thrCmds = pd->tasks[thread];
 	else
 		thrCmds = pd->syncTasks[syncThread];
-
+	// printf("PUSH %d\r\n",thread);
 	if(!queue_push(thrCmds, item))
 	{
 		return make_error_tuple(item->env, "command_push_failed");
@@ -479,7 +478,6 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	cmd->ref = enif_make_copy(item->env, argv[0]);
 	cmd->pid = pid;
 	cmd->conn = res;
-
 	enif_consume_timeslice(env,95);
 	return push_command(res->thread, -1, pd, item);
 }
@@ -496,7 +494,7 @@ static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 	if (!enif_get_int(env, argv[0], &n))
 		return atom_false;
 
-	tls_schedIndex = n;
+	tls_schedIndex = n-1;
 
 	it = queue_get_item();
 	pd->schQueues[n] = it->home;
@@ -525,6 +523,8 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 		return enif_make_badarg(env);
 
 	file = res->lastFile;
+	if (!file)
+		return atom_false;
 	if (file != lastSchedFile)
 	{
 		if (lastSchedFile != NULL)
@@ -533,7 +533,8 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 		atomic_fetch_add(&lastSchedFile->indexRefs, 1);
 	}
 	pos = res->lastWpos;
-	while (enif_get_list_cell(env, argv[1], &head,&tail))
+	tail = argv[1];
+	while (enif_get_list_cell(env, tail, &head, &tail))
 	{
 		int i;
 		indexitem *item;
@@ -549,15 +550,18 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 			item->positions = malloc(item->nPos * sizeof(u32));
 			if (!item->positions)
 				return atom_false;
-			memset(item->positions, (u32)~0, item->nPos * sizeof(u32));
+			memset(item->positions, (u8)~0, item->nPos * sizeof(u32));
 			art_insert(index, name.data, name.size, item);
+			file->indexSizes[tls_schedIndex] += name.size;
 		}
 		else
 		{
 			if (item->positions[item->nPos-1] != (u32)~0)
 			{
+				u32 oldSz = item->nPos;
 				item->nPos *= 1.5;
 				item->positions = realloc(item->positions, item->nPos * sizeof(u32));
+				memset(item->positions + oldSz, (u8)~0, (item->nPos - oldSz)*sizeof(u32));
 				if (!item->positions)
 					return atom_false;
 			}
@@ -566,6 +570,7 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 		{
 			if (item->positions[i] == (u32)~0)
 			{
+				file->indexSizes[tls_schedIndex] += sizeof(u32);
 				item->positions[i] = pos;
 				break;
 			}

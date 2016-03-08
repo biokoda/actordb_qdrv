@@ -5,20 +5,21 @@
 -define(LOAD_TEST_COMPR,false).
 
 run_test_() ->
+	?INIT,
 	% [file:delete(Fn) || Fn <- ["1"]],
+	[file:delete(Fn) || Fn <- filelib:wildcard("*index*")],
 	% Write random data over beginning
 	{ok,W} = file:open("1",[write,read,binary,raw]),
 	file:write(W,crypto:rand_bytes(400096)),
 	file:close(W),
 	[
-	fun dowrite/0,
+	% fun dowrite/0,
 	% fun cleanup/0
 	{timeout,50,fun async/0}
 	].
 
 
 dowrite() ->
-	?INIT,
 	application:ensure_all_started(crypto),
 	C = aqdrv:open(1,true),
 	Header = [<<"HEADER_PART1">>,<<"HEADER_PART2">>],
@@ -62,15 +63,16 @@ async() ->
 	ets:insert(ops,{w,0}),
 	ets:insert(ops,{r,0}),
 
-	RandBytes = [crypto:rand_bytes(390) || _ <- lists:seq(1,1000)],
+	RandBytes = [{list_to_binary(integer_to_list(N)),crypto:rand_bytes(3900)} || N <- lists:seq(1,1000)],
 	Pids = [begin
 			ets:insert(ops,{P,0}),
-		element(1,spawn_monitor(fun() -> w(P,RandBytes) end)) 
+			Sch = 1+ (P rem erlang:system_info(schedulers)),
+		element(1,spawn_opt(fun() -> w(P,RandBytes) end, [monitor,{scheduler,Sch}])) 
 	end || P <- lists:seq(1,100)],
 	receive
 		{'DOWN',_Monitor,_,_PID,Reason} ->
 			exit(Reason)
-	after 20000 ->
+	after 30000 ->
 		ok
 	end,
 	[P ! stop || P <- Pids],
@@ -86,21 +88,23 @@ rec_counts(N) ->
 
 w(N,RandList) ->
 	C = aqdrv:open(N,?LOAD_TEST_COMPR),
+	put(namebin,list_to_binary(integer_to_list(N))),
 	w(N,C,1,RandList,[]).
-w(Me,Con,Counter,[Rand|T],L) ->
+w(Me,Con,Counter,[{EvName,Rand}|T],L) ->
 	{_,QL} = erlang:process_info(self(),message_queue_len),
-	ok = aqdrv:stage_map(Con, <<"ITEM1">>, 1, byte_size(Rand)),
+	ok = aqdrv:stage_map(Con, EvName, 1, byte_size(Rand)),
 	ok = aqdrv:stage_data(Con, Rand),
 	{_,_} = aqdrv:stage_flush(Con),
 	% WPos = Time = 0,
 	{WPos,Size,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
+	ok = aqdrv:index_events(Con,[<<(get(namebin))/binary,"_",EvName/binary>>]),
 	case ok of
 		_ when QL > 0 ->
 			exit(Counter+1);
 		% _ when Time > 1000000 ->
 		% 	?debugFmt("Time1 ~pms, wpos=~pmb, ~p",[Time div 1000000, WPos div 1000000, Counter]);
 		%  Pos rem (1024*1024*1) == 0;
-		_ when Me == 1, Counter rem 1000 == 0 ->
+		_ when Me == 1, Counter rem 500 == 0 ->
 			?debugFmt("~pmb, ~p",[WPos div 1000000, Counter]),
 			% ?debugFmt("Offset=~p, diffCpy=~p, diffSetup=~p diffAll=~p",[Pos,Diff1,SetupDiff,Diff2]);
 			ok;
@@ -108,7 +112,7 @@ w(Me,Con,Counter,[Rand|T],L) ->
 			ok
 	end,
 	% ets:update_counter(ops,Me,{2,1}),
-	w(Me,Con,Counter+1,T,[Rand|L]);
+	w(Me,Con,Counter+1,T,[{EvName,Rand}|L]);
 w(Me,Con,Counter,[],L) ->
 	w(Me,Con,Counter,L,[]).
 

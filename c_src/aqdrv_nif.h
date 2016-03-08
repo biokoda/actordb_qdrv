@@ -107,6 +107,7 @@ typedef struct qfile
 	u32 syncPositions[MAX_WTHREADS];
 	// Index for every scheduler.
 	art_tree *indexes;
+	u32 *indexSizes;
 	i64 logIndex;
 	int fd;
 

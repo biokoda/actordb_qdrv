@@ -49,5 +49,5 @@ init(Info) ->
 
 init_tls() ->
 	Sch = erlang:system_info(schedulers),
-	[(catch spawn_opt(fun() -> init_tls(N) end, [{scheduler, N}])) || N <- lists:seq(0,Sch)],
+	[(catch spawn_opt(fun() -> init_tls(N) end, [{scheduler, N}])) || N <- lists:seq(1,Sch)],
 	ok.

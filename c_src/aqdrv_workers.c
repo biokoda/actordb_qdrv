@@ -106,6 +106,7 @@ qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
 		return NULL;
 	}
 	file->indexes = calloc(priv->nSch, sizeof(art_tree));
+	file->indexSizes = calloc(priv->nSch, sizeof(u32));
 	file->getMtx = enif_mutex_create("getmtx");
 	file->logIndex = logIndex;
 	for (i = 0; i < priv->nThreads; i++)
@@ -114,6 +115,26 @@ qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
 	atomic_init(&file->writeRefs, 0);
 	priv->headFile[pathIndex] = file;
 	return file;
+}
+
+static void move_forward(thrinf *data)
+{
+	qfile *curFile = data->curFile;
+	while (enif_mutex_trylock(curFile->getMtx) != 0)
+	{
+	}
+	{
+		if (!curFile->next)
+		{
+			qfile *nf = open_file(curFile->logIndex + 1, data->pathIndex, data->pd);
+			// printf("Opened new file! %lld\n",nf->logIndex);
+			curFile->next = nf;
+		}
+		atomic_fetch_sub(&curFile->writeRefs, 1);
+		data->curFile = curFile->next;
+		atomic_fetch_add(&data->curFile->writeRefs, 1);
+	}
+	enif_mutex_unlock(curFile->getMtx);
 }
 
 static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
@@ -134,6 +155,8 @@ static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
 		size = WRITE_ALIGNMENT;
 	*pSzOut = size;
 
+	// printf("writing %d from=%lld\r\n",data->windex, curFile->logIndex);
+
 	while (1)
 	{
 		writePos = atomic_fetch_add(&curFile->reservePos, size);
@@ -143,22 +166,8 @@ static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
 		}
 		else
 		{
-			DBG("Moving forward from=%lld", curFile->logIndex);
-			while (enif_mutex_trylock(curFile->getMtx) != 0)
-			{
-			}
-			{
-				if (!curFile->next)
-				{
-					qfile *nf = open_file(curFile->logIndex + 1, data->pathIndex, data->pd);
-					// printf("Opened new file! %lld\n",nf->logIndex);
-					curFile->next = nf;
-				}
-				atomic_fetch_sub(&curFile->writeRefs, 1);
-				data->curFile = curFile = curFile->next;
-				atomic_fetch_add(&curFile->writeRefs, 1);
-			}
-			enif_mutex_unlock(curFile->getMtx);
+			move_forward(data);
+			curFile = data->curFile;
 			DBG("Moving? curfile=%lld", curFile->logIndex);
 		}
 	}
@@ -249,13 +258,21 @@ void *wthread(void *arg)
 
 	while (1)
 	{
-		qitem *item = queue_pop(data->tasks);
+		qitem *item = queue_timepop(data->tasks,50);
 
-		// DBG("wthr do=%d, curfile=%lld",cmd->type, data->curFile->logIndex);
+		if (item == NULL)
+		{
+			qfile *curFile = data->curFile;
+			u32 writePos = atomic_load(&curFile->reservePos);
+			if (writePos >= FILE_LIMIT)
+				move_forward(data);
+			continue;
+		}
+
+		// printf("wthr=%d  curfile=%lld\r\n",data->windex, data->curFile->logIndex);
 		// while (item)
 		{
-			db_command *cmd;
-			cmd = (db_command*)item->cmd;
+			db_command *cmd = (db_command*)item->cmd;
 			if (cmd->type == cmd_write)
 			{
 				u32 writePos, szOut;
@@ -297,14 +314,17 @@ void *wthread(void *arg)
 	return NULL;
 }
 
-static int open_env(mdbinf *lm, const char *pth, int flags)
+static int open_env(mdbinf *lm, const char *pth, int flags, u32 size)
 {
 	int rc;
 
 	if ((rc = mdb_env_create(&lm->env)) != MDB_SUCCESS)
 		return rc;
-	if (mdb_env_set_mapsize(lm->env,1024*1024*128) != MDB_SUCCESS)
-		return rc;
+	if (size > 0)
+	{
+		if (mdb_env_set_mapsize(lm->env,size) != MDB_SUCCESS)
+			return rc;
+	}
 	if ((rc = mdb_env_open(lm->env, pth, MDB_NOSUBDIR | flags, 0664)) != MDB_SUCCESS)
 		return rc;
 	if ((rc = mdb_txn_begin(lm->env, NULL, flags, &lm->txn)) != MDB_SUCCESS)
@@ -330,30 +350,42 @@ static int index_to_lmdb(void *data, const unsigned char *key, uint32_t key_len,
 	k.mv_data = (void*)key;
 	v.mv_size = i*sizeof(u32);
 	v.mv_data = it->positions;
-	if ((i = mdb_put(m->txn, m->db, &k, &v, MDB_NOOVERWRITE)) == MDB_SUCCESS)
+	if ((i = mdb_put(m->txn, m->db, &k, &v, MDB_NOOVERWRITE)) != MDB_SUCCESS)
 	{
-		DBG("LMDB PUT FAILED %d",i);
-		return 0;
+		if (i == MDB_KEYEXIST)
+			return 0;
+		// printf("LMDB PUT FAILED %d , %.*s\r\n",i, (int)k.mv_size, k.mv_data);
+		// fflush(stdout);
+		return i;
 	}
 	else
-		return i;
+	{
+		// printf("add: %.*s %lld \r\n", (int)k.mv_size, k.mv_data, it);
+		return 0;
+	}
 }
 
 static void create_index(int pathIndex, qfile *curFile, priv_data *pd)
 {
 	int i;
+	u32 indexSize = 0;
 	mdbinf *m = calloc(1, sizeof(mdbinf));
 	char name[256];
 
 	sprintf(name, "%s/%lld.index", pd->paths[pathIndex], curFile->logIndex);
-	open_env(m, name, 0);
+	for (i = 0; i < pd->nSch; i++)
+		indexSize += curFile->indexSizes[i];
+	open_env(m, name, 0, indexSize*3);
+	// printf("Index size=%u, path=%s\r\n",indexSize,name);
 	for (i = 0; i < pd->nSch; i++)
 	{
 		art_tree *index = &curFile->indexes[i];
 		if (index->root)
 		{
-			if (art_iter(index, index_to_lmdb, &m) != 0)
+			// printf("Iterate sched indexues=%d\r\n",i);
+			if (art_iter(index, index_to_lmdb, m) != 0)
 			{
+				// printf("Iter error\r\n");
 				mdb_txn_abort(m->txn);
 				mdb_env_close(m->env);
 				unlink(name);
@@ -362,8 +394,9 @@ static void create_index(int pathIndex, qfile *curFile, priv_data *pd)
 			}
 		}
 	}
-	if (mdb_txn_commit(m->txn) != MDB_SUCCESS)
+	if ((i = mdb_txn_commit(m->txn)) != MDB_SUCCESS)
 	{
+		// printf("Commit error %d\r\n",i);
 		mdb_txn_abort(m->txn);
 		mdb_env_close(m->env);
 		unlink(name);
@@ -373,7 +406,7 @@ static void create_index(int pathIndex, qfile *curFile, priv_data *pd)
 	mdb_env_close(m->env);
 
 	memset(m, 0, sizeof(mdbinf));
-	if (open_env(m, name, MDB_RDONLY) == 0)
+	if (open_env(m, name, MDB_RDONLY, 0) == 0)
 	{
 		curFile->mdb = m;
 	}
@@ -473,7 +506,7 @@ void *sthread(void *arg)
 			// If refc==0 we can safely move forward.
 			if (curRefc == 0 && curReservePos > 0 && curFile->next != NULL)
 			{
-				DBG("Moving to next file");
+				// printf("Moving to next file indexrefs=%d, posnow=%lld\r\n",(int)indexRefs, curFile->logIndex);
 				if (!indexRefs)
 				{
 					create_index(data->pathIndex, curFile,data->pd);
@@ -489,8 +522,10 @@ void *sthread(void *arg)
 				// #endif
 				break;
 			}
-			else if (curFile->next)
+			else if (curFile->next && curRefc == 0)
+			{
 				curFile = curFile->next;
+			}
 			else
 				break;
 		}
