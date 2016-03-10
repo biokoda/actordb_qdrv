@@ -279,7 +279,7 @@ static ERL_NIF_TERM q_stage_map(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 	DBG("stage_map");
 
 	// <<EntireLen, SizeName, Name:SizeName/binary, 
-	//   DataType, Size:varint,UncompressedOffset:varint>>
+	//   DataType, Size:32/unsigned,UncompressedOffset:32/unsigned>>
 	buf[1] = (u8)bin.size;
 	buf[1+1+bin.size] = (u8)type;
 	memcpy(buf+1+1, bin.data, bin.size);
