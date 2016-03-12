@@ -142,7 +142,7 @@ static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
 	qfile *curFile = data->curFile;
 	u64 writePos = FILE_LIMIT;
 	u32 size;
-	db_command *cmd = (db_command*)item->cmd;
+	const db_command *cmd = (db_command*)item->cmd;
 	coninf *con = cmd->conn;
 
 	size = con->data.writeSize + con->map.writeSize + con->headerSize;
@@ -173,7 +173,8 @@ static u32 reserve_write(thrinf *data, qitem *item, u32 *pSzOut, u64 *diff)
 		}
 	}
 
-	do_pwrite(data, con, writePos);
+	if (do_pwrite(data, con, writePos) == -1)
+		return ~0;
 
 	// if (endPos % (1024*1024*10) == 0)
 	DBG("writePos=%llu, endPos=%llu, size=%u, file=%lld", writePos, writePos+size, size, curFile->logIndex);
@@ -247,7 +248,7 @@ static ERL_NIF_TERM do_set_socket(db_command *cmd, thrinf *thread, ErlNifEnv *en
 
 static void respond_cmd(thrinf *data, qitem *item)
 {
-	db_command *cmd = (db_command*)item->cmd;
+	const db_command *cmd = (db_command*)item->cmd;
 	if (cmd->ref)
 	{
 		enif_send(NULL, &cmd->pid, item->env, enif_make_tuple2(item->env, cmd->ref, cmd->answer));
@@ -260,16 +261,77 @@ static void respond_cmd(thrinf *data, qitem *item)
 	queue_recycle(item);
 }
 
+static ERL_NIF_TERM do_write(thrinf *data, qitem *item)
+{
+	u32 writePos, szOut;
+	TIME stop;
+	TIME start;
+	u64 diff;
+	INITTIME;
+
+	GETTIME(start);
+	writePos = reserve_write(data, item, &szOut, NULL);
+	GETTIME(stop);
+	NANODIFF(stop, start, diff);
+	// cmd->answer = enif_make_uint(item->env, resp);
+	
+	if (writePos == ~0)
+	{
+		DBG("Write failed!");
+		return atom_false;
+	}
+	else
+	{
+		return enif_make_tuple3(item->env, 
+		enif_make_uint(item->env, writePos),
+		enif_make_uint(item->env, szOut),
+		// enif_make_uint64(item->env, cmd->conn->lastFile->logIndex),
+		enif_make_uint64(item->env, diff));
+	}
+	respond_cmd(data, item);
+}
+
+static ERL_NIF_TERM do_inject(thrinf *data, qitem *item)
+{
+	ErlNifBinary bin;
+	const db_command *cmd = (db_command*)item->cmd;
+	u32 writePos, szOut;
+	coninf *con = cmd->conn;
+	const u8 doRepl = con->doReplicate;
+	const u8 doCompr = con->doCompr;
+
+	if (!enif_inspect_binary(item->env, cmd->arg, &bin))
+		return atom_false;
+
+	// bin contains all data. Header, map and body. 
+	// We set doCompr=1 so that do_pwrite leaves any buffers alone for iov elements
+	// before IOV_START_AT.
+	con->doReplicate = 0;
+	con->doCompr = 1;
+	IOV_SET(con->data.iov[con->data.iovUsed], bin.data, bin.size);
+	con->data.iovUsed++;
+	writePos = reserve_write(data, item, &szOut, NULL);
+	con->doReplicate = doRepl;
+	con->doCompr = doCompr;
+	if (writePos == ~0)
+	{
+		DBG("Write failed!");
+		return atom_false;
+	}
+	else
+	{
+		return atom_ok;
+	}
+}
+
 void *wthread(void *arg)
 {
+	u8 stop = 0;
 	thrinf* data = (thrinf*)arg;
-	int wcount = 0;
-
-	INITTIME;
 	// TIME syncSent;
 	// GETTIME(syncSent);
 
-	while (1)
+	while (!stop)
 	{
 		// qitem *item = queue_timepop(data->tasks,50);
 		// if (item == NULL)
@@ -281,41 +343,27 @@ void *wthread(void *arg)
 		// 	continue;
 		// }
 		qitem *item = queue_pop(data->tasks);
-		// while (item)
+		db_command *cmd = (db_command*)item->cmd;
+		switch (cmd->type)
 		{
-			db_command *cmd = (db_command*)item->cmd;
-			if (cmd->type == cmd_write)
-			{
-				u32 writePos, szOut;
-				TIME stop;
-				TIME start;
-				u64 diff;
-				GETTIME(start);
-				writePos = reserve_write(data, item, &szOut, NULL);
-				GETTIME(stop);
-				NANODIFF(stop, start, diff);
-				// cmd->answer = enif_make_uint(item->env, resp);
-				
-				cmd->answer = enif_make_tuple3(item->env, 
-					enif_make_uint(item->env, writePos),
-					enif_make_uint(item->env, szOut),
-					// enif_make_uint64(item->env, cmd->conn->lastFile->logIndex),
-					enif_make_uint64(item->env, diff));
-
-				respond_cmd(data, item);
-				++wcount;
-			}
-			else if (cmd->type == cmd_set_socket)
-			{
-				cmd->answer = do_set_socket(cmd, data, item->env);
-				respond_cmd(data, item);
-			}
-			else if (cmd->type == cmd_stop)
-			{
-				respond_cmd(data, item);
+			case cmd_write:
+				cmd->answer = do_write(data, item);
 				break;
-			}
+			case cmd_inject:
+				cmd->answer = do_inject(data, item);
+				break;
+			case cmd_set_socket:
+				cmd->answer = do_set_socket(cmd, data, item->env);
+				break;
+			case cmd_stop:
+				cmd->answer = atom_ok;
+				stop = 1;
+				break;
+			default:
+				cmd->answer = atom_false;
+				break;
 		}
+		respond_cmd(data, item);
 	}
 	DBG("wthread done");
 
@@ -350,36 +398,57 @@ static int index_to_lmdb(void *data, const unsigned char *key, uint32_t key_len,
 {
 	mdbinf *m = (mdbinf*)data;
 	indexitem *it = (indexitem*)value;
-	int i;
+	u32 i;
+	int rc;
 	MDB_val k, v;
 	for (i = 0; i < it->nPos; i++)
 	{
 		if (it->positions[i] == (u32)~0)
 			break;
 	}
+	if (!i)
+		return 0;
 	k.mv_size = key_len;
 	k.mv_data = (void*)key;
-	v.mv_size = i*sizeof(u32);
-	v.mv_data = it->positions;
-	if ((i = mdb_put(m->txn, m->db, &k, &v, MDB_NOOVERWRITE)) != MDB_SUCCESS)
+	v.mv_size = sizeof(u32) + i*sizeof(u32);
+	if (it->termEvnum)
+		v.mv_size += i*sizeof(u32)*2 + sizeof(u64)*2;
+	v.mv_data = NULL;
+	// v.mv_data = it->positions;
+	if ((rc = mdb_put(m->txn, m->db, &k, &v, MDB_RESERVE)) == MDB_SUCCESS)
 	{
-		// It seems art_iter can visit key twice...
-		if (i == MDB_KEYEXIST)
-			return 0;
-		// printf("LMDB PUT FAILED %d , %.*s\r\n",i, (int)k.mv_size, k.mv_data);
-		// fflush(stdout);
-		return i;
+		size_t offset = 0;
+		memcpy(v.mv_data, &i, sizeof(u32));
+		offset += sizeof(u32);
+		memcpy(v.mv_data + offset, it->positions, i*sizeof(u32));
+		if (it->termEvnum)
+		{
+			offset += i*sizeof(u32);
+			memcpy(v.mv_data + offset, &it->firstTerm, sizeof(u64));
+			offset += sizeof(u64);
+			memcpy(v.mv_data + offset, &it->firstEvnum, sizeof(u64));
+			offset += sizeof(u64);
+			memcpy(v.mv_data + offset, it->termEvnum, i*sizeof(u32)*2);
+		}
+		// if ((i = mdb_put(m->txn, m->db, &k, &v, MDB_NOOVERWRITE)) != MDB_SUCCESS)
+		// {
+		// 	// It seems art_iter can visit key twice...
+		// 	if (i == MDB_KEYEXIST)
+		// 		return 0;
+		// 	// printf("LMDB PUT FAILED %d , %.*s\r\n",i, (int)k.mv_size, k.mv_data);
+		// 	// fflush(stdout);
+		// 	return i;
+		// }
 	}
-	else
-	{
-		// printf("add: %.*s %lld \r\n", (int)k.mv_size, k.mv_data, it);
-		return 0;
-	}
+	return 0;
 }
 
 static int cleanup_index(void *data, const unsigned char *key, uint32_t key_len, void *value)
 {
-	free(value);
+	indexitem *it = (indexitem*)value;
+	free(it->positions);
+	free(it->termEvnum);
+	free(it);
 	return 0;
 }
 

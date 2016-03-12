@@ -72,10 +72,16 @@ extern ERL_NIF_TERM atom_again;
 extern ERL_NIF_TERM atom_schedulers;
 extern ErlNifResourceType *connection_type;
 
+#define INDEX_FLAG_NOTERM 0
+
 typedef struct indexitem
 {
 	u32 nPos;
 	u32 *positions;
+	// Used in replication event items
+	u64 firstTerm;
+	u64 firstEvnum;
+	u32 *termEvnum;
 	// TODO:
 	// u32 nCons;
 	// cons *consumers;
@@ -189,7 +195,8 @@ typedef enum
 	cmd_stop  = 1,
 	cmd_write = 2,
 	cmd_sync = 3,
-	cmd_set_socket = 4
+	cmd_set_socket = 4,
+	cmd_inject = 5
 } command_type;
 
 

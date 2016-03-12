@@ -13,7 +13,7 @@ run_test_() ->
 	file:write(W,crypto:rand_bytes(400096)),
 	file:close(W),
 	[
-	% fun dowrite/0,
+	fun dowrite/0,
 	% fun cleanup/0
 	{timeout,50,fun async/0}
 	].
@@ -31,6 +31,7 @@ dowrite() ->
 	?debugFmt("Mapsize ~p, datasize ~p",[MapSize, DataSize]),
 	WPos = aqdrv:write(C, [<<"WILL BE IGNORED">>], Header),
 	?debugFmt("Wpos ~p",[WPos]),
+	ok = aqdrv:index_events(C,[<<"test1">>],<<0,"1">>,1,1),
 	
 	Body2 = <<"AAABBBBCCCCDDDDEEEEFFFFF">>,
 	ok = aqdrv:stage_map(C, <<"ITEM2">>, 1, byte_size(Body2)),
@@ -39,6 +40,7 @@ dowrite() ->
 	?debugFmt("Mapsize ~p, datasize ~p",[MapSize1, DataSize1]),
 	WPos1 = aqdrv:write(C, [<<"WILL BE IGNORED">>], Header),
 	?debugFmt("Wpos ~p",[WPos1]),
+	ok = aqdrv:index_events(C,[<<"test2">>],<<0,"1">>,1,2),
 
 	{ok,F} = file:open("1",[read,binary,raw]),
 	{ok,Bin} = file:read(F,1024*1024),
@@ -89,6 +91,7 @@ rec_counts(N) ->
 w(N,RandList) ->
 	C = aqdrv:open(N,?LOAD_TEST_COMPR),
 	put(namebin,list_to_binary(integer_to_list(N))),
+	put(qname,<<0,(list_to_binary(integer_to_list(N)))/binary>>),
 	w(N,C,1,RandList,[]).
 w(Me,Con,Counter,[{EvName,Rand}|T],L) ->
 	{_,QL} = erlang:process_info(self(),message_queue_len),
@@ -97,7 +100,7 @@ w(Me,Con,Counter,[{EvName,Rand}|T],L) ->
 	{_,_} = aqdrv:stage_flush(Con),
 	% WPos = Time = 0,
 	{WPos,Size,Time} = aqdrv:write(Con, [<<"WILL BE IGNORED">>], [<<"HEADER">>]),
-	ok = aqdrv:index_events(Con,[<<(get(namebin))/binary,"_",EvName/binary>>]),
+	ok = aqdrv:index_events(Con,[<<(get(namebin))/binary,"_",EvName/binary>>], get(qname), 1, Counter),
 	case ok of
 		_ when QL > 0 ->
 			exit(Counter+1);

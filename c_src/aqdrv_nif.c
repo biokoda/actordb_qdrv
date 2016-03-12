@@ -482,6 +482,43 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	return push_command(res->thread, -1, pd, item);
 }
 
+static ERL_NIF_TERM q_inject(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	coninf *res = NULL;
+	ErlNifPid pid;
+	qitem *item;
+	db_command *cmd = NULL;
+	priv_data *pd = (priv_data*)enif_priv_data(env);
+
+	if (argc != 4)
+		return atom_false;
+
+	if(!enif_is_ref(env, argv[0]))
+		return make_error_tuple(env, "invalid_ref");
+	if(!enif_get_local_pid(env, argv[1], &pid))
+		return make_error_tuple(env, "invalid_pid");
+	if (!enif_get_resource(env, argv[2], connection_type, (void **) &res))
+		return enif_make_badarg(env);
+	if (!enif_is_binary(env, argv[3]))
+		return make_error_tuple(env, "not_bin");
+
+	item = command_create(res->thread, -1, pd);
+	if (!item)
+	{
+		DBG("Returning again!");
+		return atom_again;
+	}
+	enif_keep_resource(res);
+	cmd = (db_command*)item->cmd;
+	cmd->type = cmd_inject;
+	cmd->ref = enif_make_copy(item->env, argv[0]);
+	cmd->pid = pid;
+	cmd->conn = res;
+	cmd->arg = enif_make_copy(item->env, argv[3]);
+	enif_consume_timeslice(env,95);
+	return push_command(res->thread, -1, pd, item);
+}
+
 
 static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -504,80 +541,137 @@ static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 	return atom_ok;
 }
 
+static indexitem *insert_index(ErlNifEnv *env, ERL_NIF_TERM head, qfile *file, u32 pos, int *usedIndex)
+{
+	ErlNifBinary name;
+	art_tree *index = &file->indexes[tls_schedIndex];
+	int i;
+	indexitem *item;
+	*usedIndex = -1;
+
+	if (!enif_inspect_binary(env, head, &name))
+		return NULL;
+
+	item = art_search(index, name.data, name.size);
+	if (!item)
+	{
+		item = calloc(1, sizeof(indexitem));
+		item->nPos = 6;
+		item->positions = malloc(item->nPos * sizeof(u32));
+		if (!item->positions)
+			return NULL;
+		item->termEvnum = NULL;
+		memset(item->positions, (u8)~0, item->nPos * sizeof(u32));
+		art_insert(index, name.data, name.size, item);
+		file->indexSizes[tls_schedIndex] += name.size;
+	}
+	else
+	{
+		if (item->positions[item->nPos-1] != (u32)~0)
+		{
+			u32 oldSz = item->nPos;
+			item->nPos *= 1.5;
+			item->positions = realloc(item->positions, item->nPos * sizeof(u32));
+			memset(item->positions + oldSz, (u8)~0, (item->nPos - oldSz)*sizeof(u32));
+			if (!item->positions)
+				return NULL;
+			if (item->termEvnum)
+			{
+				item->termEvnum = realloc(item->termEvnum, item->nPos * sizeof(u32)*2);
+			}
+		}
+	}
+	for (i = 0; i < item->nPos; i++)
+	{
+		if (item->positions[i] == (u32)~0)
+		{
+			file->indexSizes[tls_schedIndex] += sizeof(u32);
+			item->positions[i] = pos;
+			*usedIndex = i;
+			break;
+		}
+	}
+	return item;
+}
+
 // Caled after replication done. 
 // Must be called after successful replication and before next write call on connection.
 // argv0 - connection
 // argv1 - list of event names
+// argv2 - name of qactor
+// argv3 - evterm
+// argv4 - evnum
 static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	// priv_data *pd = (priv_data*)enif_priv_data(env);
 	u32 pos;
 	ERL_NIF_TERM tail, head;
-	ErlNifBinary name;
 	coninf *res = NULL;
 	qfile *file = NULL;
+	u64 evterm, evnum;
+	indexitem *iev;
+	int usedIndex;
 
-	if (argc != 2)
+	if (argc != 5)
 		return atom_false;
 
 	if (!enif_get_resource(env, argv[0], connection_type, (void **) &res))
 		return enif_make_badarg(env);
+	if (!enif_is_binary(env, argv[2]))
+		return atom_false;
+	if (!enif_get_uint64(env, argv[3], (ErlNifUInt64*)&evterm))
+		return make_error_tuple(env, "evterm_not_integer");
+	if (!enif_get_uint64(env, argv[4], (ErlNifUInt64*)&evnum))
+		return make_error_tuple(env, "evnum_not_integer");
 
 	file = res->lastFile;
 	if (!file)
 		return atom_false;
 	if (!res->fileRefc)
 		return atom_false;
-	// if (file != lastSchedFile)
-	// {
-	// 	if (lastSchedFile != NULL)
-	// 		atomic_fetch_sub(&lastSchedFile->indexRefs, 1);
-	// 	lastSchedFile = file;
-	// 	atomic_fetch_add(&lastSchedFile->indexRefs, 1);
-	// }
+	if (enif_is_atom(env, argv[1]))
+	{
+		// Remove reference this is a rewind operation.
+		// Nothing will be added to index.
+		if (res->fileRefc)
+			atomic_fetch_sub(&file->conRefs, 1);
+		res->fileRefc = 0;
+		return atom_ok;
+	}
 	pos = res->lastWpos;
+
+	// A replication event has N events in it. We index the sub events and the replication
+	// event itself.
+	// First write the replication event. Name is name of queue actor. Prepended with a 0
+	// so it is distinguished from regular outside events.
+	iev = insert_index(env, argv[2], file, pos, &usedIndex);
+	if (iev == NULL)
+		return atom_false;
+	if (!iev->termEvnum)
+	{
+		// Only replication events have termEvnum array.
+		// insert_index won't create it, but it will expand it later if needed.
+		iev->termEvnum = calloc(iev->nPos, sizeof(u32)*2);
+		// We store first evterm/evnum so we can use an array of 32bit integers
+		// instead of 64. A very simple way to save quite a bit of space.
+		iev->firstTerm = evterm;
+		iev->firstEvnum = evnum;
+		file->indexSizes[tls_schedIndex] += sizeof(u64)*2;
+	}
+	if (usedIndex >= 0)
+	{
+		// termEvnum will be expanded if needed in insert_index.
+		iev->termEvnum[usedIndex*2] = evterm - iev->firstTerm;
+		iev->termEvnum[usedIndex*2+1] = evnum - iev->firstEvnum;
+		file->indexSizes[tls_schedIndex] += sizeof(u32)*2;
+	}
+
+	// Now go through list and add all outside events written in this replication event to index.
 	tail = argv[1];
 	while (enif_get_list_cell(env, tail, &head, &tail))
 	{
-		int i;
-		indexitem *item;
-		art_tree *index = &file->indexes[tls_schedIndex];
-		if (!enif_inspect_binary(env, head, &name))
+		if (insert_index(env, head, file, pos, &usedIndex) == NULL)
 			return atom_false;
-
-		item = art_search(index, name.data, name.size);
-		if (!item)
-		{
-			item = calloc(1, sizeof(indexitem));
-			item->nPos = 6;
-			item->positions = malloc(item->nPos * sizeof(u32));
-			if (!item->positions)
-				return atom_false;
-			memset(item->positions, (u8)~0, item->nPos * sizeof(u32));
-			art_insert(index, name.data, name.size, item);
-			file->indexSizes[tls_schedIndex] += name.size;
-		}
-		else
-		{
-			if (item->positions[item->nPos-1] != (u32)~0)
-			{
-				u32 oldSz = item->nPos;
-				item->nPos *= 1.5;
-				item->positions = realloc(item->positions, item->nPos * sizeof(u32));
-				memset(item->positions + oldSz, (u8)~0, (item->nPos - oldSz)*sizeof(u32));
-				if (!item->positions)
-					return atom_false;
-			}
-		}
-		for (i = 0; i < item->nPos; i++)
-		{
-			if (item->positions[i] == (u32)~0)
-			{
-				file->indexSizes[tls_schedIndex] += sizeof(u32);
-				item->positions[i] = pos;
-				break;
-			}
-		}
 	}
 	// Remove reference for connection to file.
 	atomic_fetch_sub(&file->conRefs, 1);
@@ -853,7 +947,8 @@ static ErlNifFunc nif_funcs[] = {
 	{"set_thread_fd",4,q_set_thread_fd},
 	{"replicate_opts",3,q_replicate_opts},
 	{"init_tls",1,q_init_tls},
-	{"index_events",2,q_index_events},
+	{"index_events",5,q_index_events},
+	{"inject",4,q_inject}
 };
 
 ERL_NIF_INIT(aqdrv_nif, nif_funcs, on_load, NULL, NULL, on_unload);
