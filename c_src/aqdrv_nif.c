@@ -636,6 +636,20 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 		if (res->fileRefc)
 			atomic_fetch_sub(&file->conRefs, 1);
 		res->fileRefc = 0;
+		if (iev->termEvnum)
+		{
+			int i;
+			for (i = 0; i < iev->nPos; i++)
+			{
+				if (iev->termEvnum[i*2+1] >= evnum)
+				{
+					iev->positions[i] = (u32)~0;
+					iev->termEvnum[i*2+1] = 0;
+					iev->termEvnum[i*2] = 0;
+					break;
+				}
+			}
+		}
 		return atom_ok;
 	}
 	pos = res->lastWpos;
