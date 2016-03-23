@@ -14,17 +14,7 @@
 #define u32 uint32_t
 #define i32 int32_t
 
-#if defined(_WIN32)
-	#define ATOMIC 0
-#else
-	#if defined(__STDC_NO_ATOMICS__)
-		#define ATOMIC 0
-	#else
-		#define ATOMIC 1
-	#endif
-#endif
-
-#if ATOMIC
+#ifndef _WIN32
 	#include <stdatomic.h>
 #endif
 
@@ -58,6 +48,31 @@
 	#define GETTIME(X) X = mach_absolute_time()
 	#define INITTIME mach_timebase_info_data_t timeinfo; mach_timebase_info(&timeinfo)
 	#define NANODIFF(STOP,START,DIFF)	DIFF = ((STOP-START)*timeinfo.numer)/timeinfo.denom
+#elif defined(_WIN32)
+	#define _Atomic(X) X volatile
+	#define SEMAPHORE HANDLE
+	#define TIME struct timespec
+	#define memory_order_relaxed 1
+	#define sched_yield SwitchToThread
+	#define atomic_exchange InterlockedExchangePointer
+	#define atomic_store(X,V) *(X) = V
+	#define atomic_init(X,V) *X = V
+	#define atomic_fetch_add InterlockedAdd64
+	#define atomic_fetch_sub(X,Y) InterlockedAdd64(X,-Y)
+	#define atomic_fetch_add_explicit(X,Y,Z) InterlockedAdd64(X,Z)
+	#define atomic_fetch_sub_explicit(X,Y,Z) InterlockedAdd64(X,-Z)
+	#define atomic_load_explicit(X,Z) (*X)
+	#define SEM_INIT_SET(X) (X = CreateSemaphore(NULL,1,1,NULL)) == NULL
+	#define SEM_INIT(X) (X = CreateSemaphore(NULL,0,1,NULL)) == NULL
+	#define SEM_WAIT(X) WaitForSingleObject(X, INFINITE)
+	#define SEM_TIMEDWAIT(X,T) (WaitForSingleObject(X,T) == WAIT_TIMEOUT)
+	#define SEM_POST(X) ReleaseSemaphore(X,1,NULL)
+	#define SEM_DESTROY(X) CloseHandle(X)
+	#define GETTIME(X) clock_gettime(1,&X)
+	#define INITTIME 
+	#define NANODIFF(STOP,START,DIFF) \
+	 DIFF = ((STOP.tv_sec * 1000000000UL) + STOP.tv_nsec) - \
+	 ((START.tv_sec * 1000000000UL) + START.tv_nsec)
 #else
 	// #define _POSIX_C_SOURCE 199309L
 	#include <semaphore.h>
