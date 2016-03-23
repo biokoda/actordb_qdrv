@@ -174,6 +174,7 @@ typedef struct coninf
 	lz4buf map;
 	u8 *header;
 	qfile *lastFile;
+	LZ4F_decompressionContext_t dctx;
 	// Position of last write in file
 	u32 lastWpos;
 	u32 headerSize;

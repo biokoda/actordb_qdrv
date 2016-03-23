@@ -152,7 +152,7 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	if (!con)
 		return atom_false;
 	memset(con,0,sizeof(coninf));
-	con->thread = thread % pd->nThreads;
+	con->thread = ((thread % pd->nPaths) * pd->nThreads) + (thread % pd->nThreads);
 	con->doCompr = compr;
 	if (con->doCompr)
 	{
@@ -173,6 +173,7 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	con->env = enif_alloc_env();
 	LZ4F_createCompressionContext(&con->data.cctx, LZ4F_VERSION);
 	LZ4F_createCompressionContext(&con->map.cctx, LZ4F_VERSION);
+	LZ4F_createDecompressionContext(&con->dctx, LZ4F_VERSION);
 
 	return enif_make_tuple2(env, enif_make_atom(env,"aqdrv"), enif_make_resource(env, con));
 }
@@ -482,6 +483,39 @@ static ERL_NIF_TERM q_write(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	return push_command(res->thread, -1, pd, item);
 }
 
+static ERL_NIF_TERM q_fsync(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+	coninf *res = NULL;
+	ErlNifPid pid;
+	qitem *item;
+	db_command *cmd = NULL;
+	priv_data *pd = (priv_data*)enif_priv_data(env);
+	int sthr = 0;
+
+	if(!enif_is_ref(env, argv[0]))
+		return make_error_tuple(env, "invalid_ref");
+	if(!enif_get_local_pid(env, argv[1], &pid))
+		return make_error_tuple(env, "invalid_pid");
+	if (!enif_get_resource(env, argv[2], connection_type, (void **) &res))
+		return enif_make_badarg(env);
+
+	sthr = res->thread / pd->nThreads;
+	item = command_create(-1, sthr, pd);
+	if (!item)
+	{
+		DBG("Returning again!");
+		return atom_again;
+	}
+	enif_keep_resource(res);
+	cmd = (db_command*)item->cmd;
+	cmd->type = cmd_sync;
+	cmd->ref = enif_make_copy(item->env, argv[0]);
+	cmd->pid = pid;
+	cmd->conn = res;
+	enif_consume_timeslice(env,95);
+	return push_command(-1, sthr, pd, item);
+}
+
 static ERL_NIF_TERM q_inject(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
 	coninf *res = NULL;
@@ -594,6 +628,30 @@ static indexitem *insert_index(ErlNifEnv *env, ERL_NIF_TERM head, qfile *file, u
 	return item;
 }
 
+static void do_rewind(ErlNifEnv *env, qfile *file, ERL_NIF_TERM nameTerm, u64 evnum)
+{
+	indexitem *iev;
+	ErlNifBinary name;
+
+	if (!enif_inspect_binary(env, nameTerm, &name))
+		return;
+	iev = art_search(&file->indexes[tls_schedIndex], name.data, name.size);
+	if (iev->termEvnum)
+	{
+		int i;
+		for (i = 0; i < iev->nPos; i++)
+		{
+			if (iev->termEvnum[i*2+1] >= evnum)
+			{
+				iev->positions[i] = (u32)~0;
+				iev->termEvnum[i*2+1] = 0;
+				iev->termEvnum[i*2] = 0;
+				break;
+			}
+		}
+	}
+}
+
 // Caled after replication done. 
 // Must be called after successful replication and before next write call on connection.
 // argv0 - connection
@@ -636,20 +694,7 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 		if (res->fileRefc)
 			atomic_fetch_sub(&file->conRefs, 1);
 		res->fileRefc = 0;
-		if (iev->termEvnum)
-		{
-			int i;
-			for (i = 0; i < iev->nPos; i++)
-			{
-				if (iev->termEvnum[i*2+1] >= evnum)
-				{
-					iev->positions[i] = (u32)~0;
-					iev->termEvnum[i*2+1] = 0;
-					iev->termEvnum[i*2] = 0;
-					break;
-				}
-			}
-		}
+		do_rewind(env, file, argv[2], evnum);
 		return atom_ok;
 	}
 	pos = res->lastWpos;
@@ -962,7 +1007,9 @@ static ErlNifFunc nif_funcs[] = {
 	{"replicate_opts",3,q_replicate_opts},
 	{"init_tls",1,q_init_tls},
 	{"index_events",5,q_index_events},
-	{"inject",4,q_inject}
+	{"inject",4,q_inject},
+	{"fsync",3,q_fsync},
+	// {"term_store"}
 };
 
 ERL_NIF_INIT(aqdrv_nif, nif_funcs, on_load, NULL, NULL, on_unload);

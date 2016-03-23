@@ -274,7 +274,7 @@ static ERL_NIF_TERM do_write(thrinf *data, qitem *item)
 	GETTIME(stop);
 	NANODIFF(stop, start, diff);
 	// cmd->answer = enif_make_uint(item->env, resp);
-	
+
 	if (writePos == ~0)
 	{
 		DBG("Write failed!");

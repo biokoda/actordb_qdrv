@@ -2,7 +2,7 @@
 -define(DELAY,5).
 -export([init/1, open/2, stage_map/4, stage_data/2, 
 	stage_flush/1, write/3, inject/2, set_tunnel_connector/0, set_thread_fd/4,
-	replicate_opts/2, replicate_opts/3, index_events/5]).
+	replicate_opts/2, replicate_opts/3, index_events/5, fsync/1]).
 
 init(Info) when is_map(Info) ->
 	aqdrv_nif:init(Info).
@@ -26,6 +26,16 @@ set_thread_fd(Thread,Fd,Pos,Type) ->
 			set_thread_fd(Thread, Fd, Pos, Type);
 		Res ->
 			Res
+	end.
+
+fsync({aqdrv,Con}) ->
+	Ref = make_ref(),
+	case aqdrv_nif:fsync(Ref, self(), Con) of
+		again ->
+			timer:sleep(?DELAY),
+			fsync({aqdrv,Con});
+		ok ->
+			receive_answer(Ref)
 	end.
 
 % Replication data.
