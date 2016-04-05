@@ -296,15 +296,14 @@ static ERL_NIF_TERM q_stage_map(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 
 	// <<EntireLen, SizeName, Name:SizeName/binary, 
 	//   DataType, Size:32/unsigned,UncompressedOffset:32/unsigned>>
-	buf->buf[pos+1] = (u8)bin.size;
-	buf->buf[pos+1+1+bin.size] = (u8)type;
-	memcpy(buf->buf+pos+1+1, bin.data, bin.size);
-	// Entire len (1), name len (1), type (1)
-	pos += bin.size + 1 + 1 + 1;
+	buf->buf[pos++] = bin.size+2*4+2;
+	buf->buf[pos++] = (u8)bin.size;
+	memcpy(buf->buf+pos, bin.data, bin.size);
+	pos += bin.size;
+	buf->buf[pos++] = (u8)type;
 	writeUint32(buf->buf+pos, dataSize);
 	pos += 4;
 	writeUint32(buf->buf+pos, res->data.uncomprSz);
-	buf->buf[buf->writeSize] = bin.size+2*4+3;
 
 	buf->writeSize += bin.size+2*4+3;
 	buf->uncomprSz += bin.size+2*4+3;
@@ -588,18 +587,14 @@ static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 	return atom_ok;
 }
 
-static indexitem *insert_index(ErlNifEnv *env, ERL_NIF_TERM head, qfile *file, u32 pos, int *usedIndex)
+static indexitem *insert_index(ErlNifEnv *env, ErlNifBinary *name, qfile *file, u32 pos, int *usedIndex)
 {
-	ErlNifBinary name;
 	art_tree *index = &file->indexes[tls_schedIndex];
 	int i;
 	indexitem *item;
 	*usedIndex = -1;
 
-	if (!enif_inspect_binary(env, head, &name))
-		return NULL;
-
-	item = art_search(index, name.data, name.size);
+	item = art_search(index, name->data, name->size);
 	if (!item)
 	{
 		item = calloc(1, sizeof(indexitem));
@@ -609,8 +604,8 @@ static indexitem *insert_index(ErlNifEnv *env, ERL_NIF_TERM head, qfile *file, u
 			return NULL;
 		item->termEvnum = NULL;
 		memset(item->positions, (u8)~0, item->nPos * sizeof(u32));
-		art_insert(index, name.data, name.size, item);
-		file->indexSizes[tls_schedIndex] += name.size;
+		art_insert(index, name->data, name->size, item);
+		file->indexSizes[tls_schedIndex] += name->size;
 	}
 	else
 	{
@@ -682,6 +677,7 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 	u64 evterm, evnum;
 	indexitem *iev;
 	int usedIndex;
+	ErlNifBinary name;
 
 	if (argc != 5)
 		return atom_false;
@@ -716,7 +712,9 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 	// event itself.
 	// First write the replication event. Name is name of queue actor. Prepended with a 0
 	// so it is distinguished from regular outside events.
-	iev = insert_index(env, argv[2], file, pos, &usedIndex);
+	if (!enif_inspect_binary(env, argv[2], &name))
+		return atom_false;
+	iev = insert_index(env, &name, file, pos, &usedIndex);
 	if (iev == NULL)
 		return atom_false;
 	if (!iev->termEvnum)
@@ -738,13 +736,58 @@ static ERL_NIF_TERM q_index_events(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 		file->indexSizes[tls_schedIndex] += sizeof(u32)*2;
 	}
 
-	// Now go through list and add all outside events written in this replication event to index.
-	tail = argv[1];
-	while (enif_get_list_cell(env, tail, &head, &tail))
+	if (enif_is_list(env, argv[1]))
 	{
-		if (insert_index(env, head, file, pos, &usedIndex) == NULL)
-			return atom_false;
+		// Now go through list and add all outside events written in this replication event to index.
+		tail = argv[1];
+		while (enif_get_list_cell(env, tail, &head, &tail))
+		{
+			if (!enif_inspect_binary(env, head, &name))
+				return atom_false;
+			if (insert_index(env, &name, file, pos, &usedIndex) == NULL)
+				return atom_false;
+		}
 	}
+	else if(!enif_inspect_binary(env, argv[1], &name))
+	{
+		u32 sz;
+		u8 *buf = (u8*)name.data;
+		u8 *bufEnd = (u8*)name.data + name.size;
+
+		if (name.size < 24)
+			return atom_false;
+		// Read header size
+		memcpy(&sz, buf+4, sizeof(sz));
+		// Move over header
+		buf += 8+sz;
+		if (buf+8 >= bufEnd)
+			return atom_false;
+		// Read map size
+		memcpy(&sz, buf+4, sizeof(sz));
+		if (buf+sz+8 >= bufEnd)
+			return atom_false;
+		// Move end marker to end of map
+		bufEnd = buf + sz + 8;
+		buf += 8;
+		// <<EntireLen, SizeName, Name:SizeName/binary, 
+		//   DataType, Size:32/unsigned,UncompressedOffset:32/unsigned>>
+		while (buf < bufEnd)
+		{
+			u8 entireLen = buf[0];
+			u8 sizeLen = buf[1];
+			ErlNifBinary cname;
+
+			cname.data = buf+2;
+			cname.size = sizeLen;
+
+			if (insert_index(env, &cname, file, pos, &usedIndex) == NULL)
+				return atom_false;
+
+			buf += entireLen + 1;
+		}
+	}
+	else
+		return atom_false;
 	// Remove reference for connection to file.
 	atomic_fetch_sub(&file->conRefs, 1);
 	res->fileRefc = 0;
