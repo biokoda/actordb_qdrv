@@ -99,16 +99,16 @@ typedef struct qfile
 	ErlNifMutex *getMtx;
 	u8 *wmap;
 	mdbinf *mdb;
-	_Atomic(u64) reservePos;
+	_Atomic(i64) reservePos;
 	// reference count how many write threads are still referencing it
 	_Atomic(char) writeRefs;
 	// reference count how many connections are between write and index_events for file.
 	// This means how many connections are still replicating a write to this file.
 	// Once it and writeRefs is 0, we can create a file index (mdb).
-	_Atomic(long) conRefs;
+	_Atomic(i64) conRefs;
 	// for every write thread what was last full byte. 
 	// Written to on write threads, read by sync thread.
-	_Atomic(u32) thrPositions[MAX_WTHREADS];
+	_Atomic(i64) thrPositions[MAX_WTHREADS];
 	// for sync thread to keep track of progress
 	// and what requires syncing. It is a copy of thrPositions
 	// at the time of last sync.

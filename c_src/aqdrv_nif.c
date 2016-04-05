@@ -199,7 +199,7 @@ static u32 add_iov_bin(coninf *con, lz4buf *buf, ErlNifBinary bin)
 	return bin.size;
 }
 
-static u32 add_bin(coninf *con, lz4buf *buf, ErlNifBinary bin, u32 offset)
+static u32 add_compr_bin(coninf *con, lz4buf *buf, ErlNifBinary bin, u32 offset)
 {
 	u32 toWrite = MIN(64*1024, bin.size - offset);
 	size_t bWritten = 0;
@@ -259,8 +259,8 @@ static ERL_NIF_TERM q_stage_map(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 	int type;
 	coninf *res = NULL;
 	u32 dataSize;
-	u8 size = 0;
-	u8 buf[255];
+	u8 pos = 0;
+	lz4buf *buf;
 
 	if (argc != 4)
 		return atom_false;
@@ -279,23 +279,35 @@ static ERL_NIF_TERM q_stage_map(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
 
 	DBG("stage_map");
 
+	buf = &res->map;
+
+	if (buf->writeSize == 0)
+	{
+		writeUint32LE(buf->buf, 0x184D2A50);
+		buf->writeSize = 8;
+	}
+
+	while ((bin.size+2*4+3) > buf->bufSize - buf->writeSize)
+	{
+		buf->bufSize *= 1.5;
+		buf->buf = realloc(buf->buf, buf->bufSize);
+	}
+	pos = buf->writeSize;
+
 	// <<EntireLen, SizeName, Name:SizeName/binary, 
 	//   DataType, Size:32/unsigned,UncompressedOffset:32/unsigned>>
-	buf[1] = (u8)bin.size;
-	buf[1+1+bin.size] = (u8)type;
-	memcpy(buf+1+1, bin.data, bin.size);
+	buf->buf[pos+1] = (u8)bin.size;
+	buf->buf[pos+1+1+bin.size] = (u8)type;
+	memcpy(buf->buf+pos+1+1, bin.data, bin.size);
 	// Entire len (1), name len (1), type (1)
-	size = bin.size + 1 + 1 + 1;
-	writeUint32(buf+size, dataSize);
-	size += 4;
-	writeUint32(buf+size, res->data.uncomprSz);
-	size += 4;
-	buf[0] = size;
+	pos += bin.size + 1 + 1 + 1;
+	writeUint32(buf->buf+pos, dataSize);
+	pos += 4;
+	writeUint32(buf->buf+pos, res->data.uncomprSz);
+	buf->buf[buf->writeSize] = bin.size+2*4+3;
 
-	bin.data = buf;
-	bin.size = size;
-	if (!add_bin(res, &res->map, bin, 0))
-		return atom_false;
+	buf->writeSize += bin.size+2*4+3;
+	buf->uncomprSz += bin.size+2*4+3;
 
 	return atom_ok;
 }
@@ -331,7 +343,7 @@ static ERL_NIF_TERM q_stage_data(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
 	{
 		if (!enif_inspect_binary(res->env, argv[1], &bin))
 			return make_error_tuple(env, "not binary");
-		offset = add_bin(res, &res->data, bin, offset);
+		offset = add_compr_bin(res, &res->data, bin, offset);
 		if (!offset)
 			return atom_false;
 	}
@@ -352,12 +364,12 @@ static ERL_NIF_TERM q_flush(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
 	DBG("flushing");
 
-	bWritten = LZ4F_compressEnd(con->map.cctx, 
-			con->map.buf + con->map.writeSize, 
-			con->map.bufSize - con->map.writeSize, NULL);
-	if (LZ4F_isError(bWritten))
-		return atom_false;
-	con->map.writeSize += bWritten;
+	// bWritten = LZ4F_compressEnd(con->map.cctx, 
+	// 		con->map.buf + con->map.writeSize, 
+	// 		con->map.bufSize - con->map.writeSize, NULL);
+	// if (LZ4F_isError(bWritten))
+	// 	return atom_false;
+	// con->map.writeSize += bWritten;
 
 	if (con->doCompr)
 	{
@@ -372,6 +384,7 @@ static ERL_NIF_TERM q_flush(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	{
 		writeUint32LE(con->data.buf + 4, con->data.writeSize-8);
 	}
+	writeUint32LE(con->map.buf + 4, con->map.writeSize-8);
 
 	enif_consume_timeslice(env,95);
 	return enif_make_tuple2(env, 
@@ -753,7 +766,6 @@ static ERL_NIF_TERM q_replicate_opts(ErlNifEnv *env, int argc, const ERL_NIF_TER
 	if (!enif_inspect_iolist_as_binary(env, argv[1], &bin))
 		return make_error_tuple(env, "not_iolist");
 
-	DBG("do_replicate_opts %zu", bin.size);
 	if (res->packetPrefixSize < bin.size)
 	{
 		free(res->packetPrefix);

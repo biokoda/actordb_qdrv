@@ -57,7 +57,7 @@
 	#define atomic_exchange InterlockedExchangePointer
 	#define atomic_store(X,V) *(X) = V
 	#define atomic_init(X,V) *X = V
-	#define atomic_fetch_add InterlockedAdd64
+	#define atomic_fetch_add(X,Y) InterlockedAdd64
 	#define atomic_fetch_sub(X,Y) InterlockedAdd64(X,-Y)
 	#define atomic_fetch_add_explicit(X,Y,Z) InterlockedAdd64(X,Z)
 	#define atomic_fetch_sub_explicit(X,Y,Z) InterlockedAdd64(X,-Z)

@@ -26,7 +26,7 @@ dowrite() ->
 	Header = [<<"HEADER_PART1">>,<<"HEADER_PART2">>],
 	HeaderSz = iolist_size(Header),
 	Body = <<"DATA SECTION START",(crypto:rand_bytes(4096))/binary>>,
-	ok = aqdrv:stage_map(C, <<"ITEM1">>, 1, byte_size(Body)),
+	ok = aqdrv:stage_map(C, <<"ITEM1">>, 12, byte_size(Body)),
 	ok = aqdrv:stage_data(C, Body),
 	{MapSize, DataSize} = aqdrv:stage_flush(C),
 	?debugFmt("Mapsize ~p, datasize ~p",[MapSize, DataSize]),
@@ -35,8 +35,8 @@ dowrite() ->
 	ok = aqdrv:index_events(C,[<<"test1">>],<<0,"1">>,1,1),
 	
 	Body2 = <<"AAABBBBCCCCDDDDEEEEFFFFF">>,
-	ok = aqdrv:stage_map(C, <<"ITEM2">>, 1, byte_size(Body2)),
-	ok = aqdrv:stage_data(C, Body2),
+	ok = aqdrv:stage_map(C, <<"ITEM2">>, 12, byte_size(Body2)),
+		ok = aqdrv:stage_data(C, Body2),
 	{MapSize1, DataSize1} = aqdrv:stage_flush(C),
 	?debugFmt("Mapsize ~p, datasize ~p",[MapSize1, DataSize1]),
 	WPos1 = aqdrv:write(C, [<<"WILL BE IGNORED">>], Header),
@@ -44,10 +44,11 @@ dowrite() ->
 	ok = aqdrv:index_events(C,[<<"test2">>],<<0,"1">>,1,2),
 
 	{ok,F} = file:open("1",[read,binary,raw]),
-	{ok,Bin} = file:read(F,1024*1024),
+	{ok,Bin} = file:read(F,1024),
 	<<(16#184D2A50):32/unsigned-little, HeaderSz:32/unsigned-little,
 		"HEADER_PART1","HEADER_PART2",
-	  (16#184D2204):32/unsigned-little,_/binary>> = Bin,
+	  (16#184D2A50):32/unsigned-little,_:32,_,_,"ITEM1",
+	  _/binary>> = Bin,
 	file:close(F),
 	ok.
 
