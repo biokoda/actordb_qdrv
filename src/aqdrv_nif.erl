@@ -1,8 +1,10 @@
 -module(aqdrv_nif).
 -export([init/1, open/2, stage_map/4,stage_data/3,
 	stage_flush/1, write/5,inject/4, set_tunnel_connector/0, set_thread_fd/4,
-	replicate_opts/3,index_events/5, fsync/3]).
+	replicate_opts/3,index_events/5, fsync/3, stop/0, init_tls/1]).
 
+stop() ->
+	exit(nif_library_not_loaded).
 open(_,_) ->
 	exit(nif_library_not_loaded).
 stage_map(_,_,_,_) ->
@@ -44,7 +46,7 @@ init(Info) ->
 	end,
 	case erlang:load_nif(FN, Info#{schedulers => Schedulers,logname => LogName}) of
 		ok ->
-			init_tls();
+			init_tls1();
 		{error,{upgrade,_}} ->
 			ok;
 		{error,{reload,_}} ->
@@ -52,7 +54,7 @@ init(Info) ->
 	end.
 
 % Scheduler threads must know their index.
-init_tls() ->
-	Sch = erlang:system_info(schedulers),
+init_tls1() ->
+	Sch = erlang:system_info(schedulers_online),
 	[(catch spawn_opt(fun() -> init_tls(N) end, [{scheduler, N}])) || N <- lists:seq(1,Sch)],
 	ok.

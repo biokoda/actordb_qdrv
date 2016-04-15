@@ -1,4 +1,4 @@
-// #define _TESTDBG_
+#define _TESTDBG_
 #include "aqdrv_nif.h"
 
 #ifdef _WIN32
@@ -20,6 +20,7 @@ ERL_NIF_TERM atom_tcpfail;
 ERL_NIF_TERM atom_drivername;
 ERL_NIF_TERM atom_again;
 ERL_NIF_TERM atom_schedulers;
+ERL_NIF_TERM atom_recycle;
 ErlNifResourceType *connection_type;
 
 FILE *g_log = NULL;
@@ -138,6 +139,7 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	u32 thread;
 	coninf *con;
 	u32 compr;
+	ERL_NIF_TERM resTerm;
 	priv_data *pd = (priv_data*)enif_priv_data(env);
 
 	if (argc != 2)
@@ -151,6 +153,8 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	con = enif_alloc_resource(connection_type, sizeof(coninf));
 	if (!con)
 		return atom_false;
+	resTerm = enif_make_resource(env, con);
+	enif_release_resource(con);
 	memset(con,0,sizeof(coninf));
 	con->thread = ((thread % pd->nPaths) * pd->nThreads) + (thread % pd->nThreads);
 	con->doCompr = compr;
@@ -175,7 +179,7 @@ static ERL_NIF_TERM q_open(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 	LZ4F_createCompressionContext(&con->map.cctx, LZ4F_VERSION);
 	LZ4F_createDecompressionContext(&con->dctx, LZ4F_VERSION);
 
-	return enif_make_tuple2(env, enif_make_atom(env,"aqdrv"), enif_make_resource(env, con));
+	return enif_make_tuple2(env, enif_make_atom(env,"aqdrv"), resTerm);
 }
 
 static u32 add_iov_bin(coninf *con, lz4buf *buf, ErlNifBinary bin)
@@ -576,7 +580,6 @@ static ERL_NIF_TERM q_init_tls(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 
 	if (!enif_get_int(env, argv[0], &n))
 		return atom_false;
-
 	n--;
 	tls_schedIndex = n;
 
@@ -848,7 +851,8 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	ERL_NIF_TERM value;
 	const ERL_NIF_TERM *pathTuple;
 	const ERL_NIF_TERM *indexTuple;
-	int i, j;
+	const ERL_NIF_TERM *recycleTuple;
+	int i, j, nrecycle;
 
 	priv = calloc(1,sizeof(priv_data));
 	*priv_out = priv;
@@ -868,6 +872,7 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	atom_drivername = enif_make_atom(env, "aqdrv");
 	atom_again = enif_make_atom(env, "again");
 	atom_schedulers = enif_make_atom(env, "schedulers");
+	atom_recycle = enif_make_atom(env, "recycle");
 
 	connection_type = enif_open_resource_type(env, NULL, "connection_type",
 		destruct_connection, ERL_NIF_RT_CREATE, NULL);
@@ -905,6 +910,14 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			return -1;
 		}
 	}
+	if (enif_get_map_value(env, info, atom_recycle, &value))
+	{
+		if (!enif_get_tuple(env, value, &nrecycle, &recycleTuple))
+		{
+			DBG("Recycle not tuple");
+			return -1;
+		}
+	}
 	if (enif_get_map_value(env, info, atom_paths, &value))
 	{
 		if (!enif_get_tuple(env, value, &priv->nPaths, &pathTuple))
@@ -912,6 +925,11 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			DBG("Param not tuple");
 			return -1;
 		}
+	}
+	if (priv->nPaths != nrecycle)
+	{
+		DBG("Recycle tuple must be as large as path tuple");
+		return -1;
 	}
 	// if (enif_get_map_value(env, info, atom_compr, &value))
 	// {
@@ -932,19 +950,46 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 	priv->paths = calloc(priv->nPaths*priv->nThreads, sizeof(char*));
 	priv->headFile = calloc(priv->nPaths, sizeof(qfile*));
 	priv->tailFile = calloc(priv->nPaths, sizeof(qfile*));
+	priv->recycle = calloc(priv->nPaths, sizeof(recq*));
 	// priv->frwMtx = calloc(priv->nPaths, sizeof(ErlNifMutex*));
 
 	for (i = 0; i < priv->nPaths; i++)
 	{
 		qfile *nf;
 		i64 logIndex;
+		const ERL_NIF_TERM *pathRecTuple;
 		thrinf *inf = calloc(1,sizeof(thrinf));
+		recq *pathRec = priv->recycle[i];
 
-		priv->paths[i] = calloc(1,256);
-		enif_get_string(env,pathTuple[i],priv->paths[i],256,ERL_NIF_LATIN1);
+		if (!enif_get_tuple(env, recycleTuple[i], &nrecycle, &pathRecTuple))
+		{
+			DBG("Unable to read recycle tuple for path %d",i);
+			return -1;
+		}
+		for (j = 0; j < nrecycle; j++)
+		{
+			recq *nr = calloc(1,sizeof(recq));
+			if (enif_get_string(env, pathRecTuple[j], nr->name, sizeof(nr->name), ERL_NIF_LATIN1) < 0)
+			{
+				DBG("Recycle name too long");
+				return -1;
+			}
+			DBG("Adding to recycle list: %s",nr->name);
+			nr->next = pathRec;
+			pathRec = nr;
+		}
+		priv->recycle[i] = pathRec;
+
+		priv->paths[i] = calloc(1,PATH_MAX);
+		enif_get_string(env,pathTuple[i],priv->paths[i],PATH_MAX,ERL_NIF_LATIN1);
 		enif_get_int64(env,indexTuple[i],(ErlNifSInt64*)&logIndex);
 
-		// priv->frwMtx[i] = enif_mutex_create("frwmtx");
+		if (strlen(priv->paths[i]) > PATH_MAX-50)
+		{
+			DBG("Path too long");
+			return -1;
+		}
+
 		if (open_file(logIndex, i, priv) == NULL)
 			return -1;
 		priv->tailFile[i] = priv->headFile[i];
@@ -972,7 +1017,8 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 			inf->pd = priv;
 			inf->curFile = priv->tailFile[i];
 			inf->env = enif_alloc_env();
-			atomic_fetch_add(&inf->curFile->writeRefs, 1);
+			if (inf->curFile)
+				atomic_fetch_add(&inf->curFile->writeRefs, 1);
 
 			if (enif_thread_create("wthr", &(priv->wtids[index]), wthread, inf, NULL) != 0)
 			{
@@ -985,26 +1031,16 @@ static int on_load(ErlNifEnv* env, void** priv_out, ERL_NIF_TERM info)
 
 static void on_unload(ErlNifEnv* env, void* pd)
 {
-	int i;
 	priv_data *priv = (priv_data*)pd;
+	int i;
+	// priv_data *priv = (priv_data*)enif_priv_data(env);
 	qitem *item;
 	db_command *cmd = NULL;
-	DBG("on_unload");
-
-	for (i = 0; i < priv->nThreads * priv->nPaths; i++)
-	{
-		item = command_create(i, -1, priv);
-		cmd = (db_command*)item->cmd;
-		cmd->type = cmd_stop;
-		push_command(i, -1, priv, item);
-
-		enif_thread_join((ErlNifTid)priv->wtids[i],NULL);
-	}
 
 	for (i = 0; i < priv->nPaths; i++)
 	{
-		qfile *f = priv->tailFile[i];
-
+		if (!priv->stids[i])
+			continue;
 		item = command_create(-1, i, priv);
 		cmd = (db_command*)item->cmd;
 		cmd->type = cmd_stop;
@@ -1012,18 +1048,42 @@ static void on_unload(ErlNifEnv* env, void* pd)
 
 		enif_thread_join((ErlNifTid)priv->stids[i],NULL);
 		free(priv->paths[i]);
+	}
+
+	for (i = 0; i < priv->nThreads * priv->nPaths; i++)
+	{
+		if (!priv->wtids[i])
+			continue;
+		item = command_create(i, -1, priv);
+		cmd = (db_command*)item->cmd;
+		cmd->type = cmd_stop;
+		push_command(i, -1, priv, item);
+
+		enif_thread_join((ErlNifTid)priv->wtids[i],NULL);
+	}
+	for (i = 0; i < priv->nPaths; i++)
+	{
+		qfile *f = priv->tailFile[i];
 
 		while (f != NULL)
 		{
 			qfile *fc = f;
 			enif_mutex_destroy(fc->getMtx);
 			close(fc->fd);
-			// free(fc->thrPositions);
-			// free(fc->syncPositions);
 			free(fc);
 			f = f->next;
 		}
-		// enif_mutex_destroy(priv->frwMtx[i]);
+	}
+
+	for (i = 0; i < priv->nPaths; i++)
+	{
+		recq *r = priv->recycle[i];
+		while (r != NULL)
+		{
+			recq *rtmp = r;
+			r = r->next;
+			free(rtmp);
+		}
 	}
 
 	for (i = 0; i < priv->nSch; i++)
@@ -1044,6 +1104,7 @@ static void on_unload(ErlNifEnv* env, void* pd)
 	free(priv->stids);
 	free(priv->headFile);
 	free(priv->tailFile);
+	free(priv->recycle);
 	free(priv);
 
 #ifdef _TESTDBG_
@@ -1064,6 +1125,7 @@ static ErlNifFunc nif_funcs[] = {
 	{"index_events",5,q_index_events},
 	{"inject",4,q_inject},
 	{"fsync",3,q_fsync},
+	// {"stop",0,q_stop},
 	// {"term_store"}
 };
 

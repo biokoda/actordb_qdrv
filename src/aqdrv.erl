@@ -15,9 +15,10 @@ open(Hash,true) ->
 open(Hash,false) ->
 	aqdrv_nif:open(Hash,0).
 
-% Replication socket.
+% Set replicator process.
 set_tunnel_connector() ->
 	aqdrv_nif:set_tunnel_connector().
+% Set replication socket fd.
 set_thread_fd(Thread,Fd,Pos,Type) ->
 	case aqdrv_nif:set_thread_fd(Thread,Fd,Pos,Type) of
 		again ->
@@ -28,6 +29,7 @@ set_thread_fd(Thread,Fd,Pos,Type) ->
 			Res
 	end.
 
+% Make sure all data for last write on connection has been synced.
 fsync({aqdrv,Con}) ->
 	Ref = make_ref(),
 	case aqdrv_nif:fsync(Ref, self(), Con) of

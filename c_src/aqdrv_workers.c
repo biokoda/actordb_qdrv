@@ -89,10 +89,24 @@ static int do_pwrite(thrinf *data, coninf *con, u32 writePos)
 
 qfile *open_file(i64 logIndex, int pathIndex, priv_data *priv)
 {
-	char filename[128];
+	char oldName[PATH_MAX];
+	char filename[PATH_MAX];
 	int i;
 	qfile *file = calloc(1, sizeof(qfile));
-	sprintf(filename, "%s/%lld",priv->paths[pathIndex], (long long int)logIndex);
+	recq *recycle = priv->recycle[pathIndex];
+	sprintf(filename, "%s/%lld.q",priv->paths[pathIndex], (long long int)logIndex);
+	if (recycle != NULL)
+	{
+		snprintf(oldName, sizeof(oldName), "%s/%s",priv->paths[pathIndex], recycle->name);
+		DBG("Using recycle! %s",oldName);
+		rename(oldName, filename);
+		priv->recycle[pathIndex] = recycle->next;
+		free(recycle);
+	}
+	else
+	{
+		DBG("Not using recycle!");
+	}
 	file->fd = open(filename, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP);
 	if (file->fd > 0)
 	{
@@ -365,7 +379,7 @@ void *wthread(void *arg)
 		}
 		respond_cmd(data, item);
 	}
-	DBG("wthread done");
+	printf("wthread done\r\n");
 
 	enif_free_env(data->env);
 	queue_destroy(data->tasks);
@@ -662,8 +676,9 @@ void *sthread(void *arg)
 		if (cmd && cmd->type == cmd_stop)
 			break;
 	}
-
-	enif_free_env(data->env);
+	printf("sthread done\r\n");
+	if (data->env)
+		enif_free_env(data->env);
 	queue_destroy(data->tasks);
 	free(data);
 	return NULL;

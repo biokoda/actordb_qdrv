@@ -43,7 +43,7 @@
 // Every new write is aligned to this.
 #define WRITE_ALIGNMENT 512
 #define PGSZ 4096
-
+#define PATH_MAX 256
 extern FILE *g_log;
 #if defined(_TESTDBG_)
 #ifndef _WIN32
@@ -122,6 +122,12 @@ typedef struct qfile
 	struct qfile *next;
 }qfile;
 
+typedef struct recq
+{
+	char name[20];
+	struct recq *next;
+}recq;
+
 typedef struct priv_data
 {
 	int nPaths;
@@ -130,6 +136,7 @@ typedef struct priv_data
 	queue **syncTasks;
 	qfile **headFile;
 	qfile **tailFile;
+	recq **recycle;
 
 	char **paths;
 #ifndef _TESTAPP_

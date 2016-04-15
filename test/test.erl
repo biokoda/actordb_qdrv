@@ -1,22 +1,31 @@
 -module(test).
 -include_lib("eunit/include/eunit.hrl").
 -define(CFG,#{wthreads => 3, startindex => {1}, paths => {"./"}, pwrite => 0}).
--define(INIT,aqdrv:init(?CFG)).
+-define(INIT,init()).
 -define(LOAD_TEST_COMPR,false).
 
+init() ->
+	C = ?CFG,
+	RL = [begin
+		% Write random data over beginning
+		{ok,W} = file:open(Nm,[write,read,binary,raw]),
+		file:write(W,crypto:rand_bytes(400096)),
+		file:close(W),
+		file:rename(Nm, Nm++".r"),
+		Nm++".r"
+	end || Nm <- filelib:wildcard("*.q")++filelib:wildcard("*.r")],
+	?debugFmt("RL =~p",[RL]),
+	aqdrv:init((?CFG)#{recycle => {list_to_tuple(RL)}}).
+
 run_test_() ->
-	?INIT,
 	erlang:system_flag(schedulers_online,4),
+	?INIT,
 	% [file:delete(Fn) || Fn <- ["1"]],
 	[file:delete(Fn) || Fn <- filelib:wildcard("*index*")],
-	% Write random data over beginning
-	{ok,W} = file:open("1",[write,read,binary,raw]),
-	file:write(W,crypto:rand_bytes(400096)),
-	file:close(W),
 	[
-	fun dowrite/0,
+	fun dowrite/0
 	% fun cleanup/0
-	{timeout,50,fun async/0}
+	% {timeout,50,fun async/0}
 	].
 
 
@@ -43,25 +52,30 @@ dowrite() ->
 	?debugFmt("Wpos ~p",[WPos1]),
 	ok = aqdrv:index_events(C,[<<"test2">>],<<0,"1">>,1,2),
 
-	{ok,F} = file:open("1",[read,binary,raw]),
+	{ok,F} = file:open("1.q",[read,binary,raw]),
 	{ok,Bin} = file:read(F,1024),
 	<<(16#184D2A50):32/unsigned-little, HeaderSz:32/unsigned-little,
 		"HEADER_PART1","HEADER_PART2",
 	  (16#184D2A50):32/unsigned-little,_:32,_,_,"ITEM1",
 	  _/binary>> = Bin,
-	file:close(F),
-	ok.
+	file:close(F).
 
 % cleanup() ->
 % 	?debugFmt("Cleanup",[]),
 % 	garbage_collect(),
+% 	aqdrv:stop(),
+% 	% ok.
+% 	cleanup1().
+% cleanup1() ->
+% 	?debugFmt("Deleting",[]),
 % 	true = code:delete(aqdrv_nif),
+% 	?debugFmt("Purging",[]),
 % 	true = code:purge(aqdrv_nif),
+% 	?debugFmt("Done",[]),
 % 	ok.
 
 async() ->
 	?debugFmt("Running many async reads/writes for 20s",[]),
-	% ?INIT,
 	application:ensure_all_started(crypto),
 	ets:new(ops,[set,public,named_table,{write_concurrency,true}]),
 	ets:insert(ops,{w,0}),
